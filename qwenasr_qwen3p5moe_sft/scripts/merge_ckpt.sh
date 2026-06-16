@@ -1,0 +1,1 @@
+python -c "from model_ep import merge_ep_checkpoint; merge_ep_checkpoint('output_ep_fast')"

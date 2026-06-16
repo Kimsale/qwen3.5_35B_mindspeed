@@ -1,0 +1,1 @@
+from .lpu_pb2 import ASRProto

@@ -1,0 +1,34 @@
+
+{
+    "file_type": "LMDB",
+    "datasets": [
+        {
+        "wav": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.wav.mdb_for_gemma3.json",
+        "ed_label": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_trans_rlt_for_gemma3.mdb.json",
+        "ce_label": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_fa_ph_for_gemma3.mdb.json",
+        "ed_label_kws": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_trans_kws_for_gemma3.mdb.json",
+        "ed_label_src": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_trans_src_for_gemma3.mdb.json",
+        "ed_label_asr": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_trans_asr_for_gemma3.mdb.json",
+        "ed_label_acc": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_trans_acc_for_gemma3.mdb.json",
+        "data_num": 1568,
+        "range": [
+            0,
+            1000
+        ]
+       },
+       {
+        "wav": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.wav.mdb_for_gemma3.json",
+        "ed_label": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_trans_rlt_for_gemma3.mdb.json",
+        "ce_label": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_fa_ph_for_gemma3.mdb.json",
+        "ed_label_kws": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_trans_kws_for_gemma3.mdb.json",
+        "ed_label_src": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_trans_src_for_gemma3.mdb.json",
+        "ed_label_asr": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_trans_asr_for_gemma3.mdb.json",
+        "ed_label_acc": "/repo1/yjjiang11/work/vibecoding/Qwen3.5/qwenasr_qwen3p5moe_sft_lmdb/lmdbdata/lmdb/0.mlf_trans_acc_for_gemma3.mdb.json",
+        "data_num": 1568,
+        "range": [
+            0,
+            1200
+        ]
+       }
+    ]
+}

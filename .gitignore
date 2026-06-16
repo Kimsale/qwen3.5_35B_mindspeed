@@ -34,3 +34,9 @@ package/
 *.swo
 *~
 .DS_Store
+
+# qwenasr_qwen3p5moe_sft: large model/data artifacts (code only in repo)
+qwenasr_qwen3p5moe_sft/lmdbdata/lmdb/
+qwenasr_qwen3p5moe_sft/lmdbdata/res/
+qwenasr_qwen3p5moe_sft/lmdbdata/pasre_lmdb_code/wavs/
+qwenasr_qwen3p5moe_sft/**/__pycache__/
