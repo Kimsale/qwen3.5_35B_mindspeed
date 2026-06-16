@@ -1,0 +1,36 @@
+# 大文件和训练产物
+output/
+logs/
+metrics/
+*.log
+*.pth
+*.ckpt
+*.safetensors
+
+# 数据目录（大文件）
+data_audio/
+data_audio_*/
+data_hulk_dist/
+data_hulk_dist_30k/
+
+# 自动生成的profile结果
+profiling/
+autotune_output/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+scripts/__pycache__/
+
+# 打包产物
+package/
+
+# 环境备份
+*_env_backup*.txt
+
+# 临时文件
+*.swp
+*.swo
+*~
+.DS_Store
