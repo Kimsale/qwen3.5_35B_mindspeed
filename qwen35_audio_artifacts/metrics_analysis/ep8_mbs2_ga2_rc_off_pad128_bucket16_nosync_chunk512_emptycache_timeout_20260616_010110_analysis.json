@@ -1,0 +1,154 @@
+{
+  "tag": "ep8_mbs2_ga2_rc_off_pad128_bucket16_nosync_chunk512_emptycache_timeout",
+  "config": "/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_mbs2_ga2_rc_off_pad128_bucket16_nosync_chunk512_emptycache_timeout.yaml",
+  "train_log": "/data/sejin/baseline_26/logs/ep8_mbs2_ga2_rc_off_pad128_bucket16_nosync_chunk512_emptycache_timeout_20260616_010110.log",
+  "monitor_json": "/data/sejin/baseline_26/metrics/ep8_mbs2_ga2_rc_off_pad128_bucket16_nosync_chunk512_emptycache_timeout_20260616_010110_npu_full.json",
+  "skip_steps": 10,
+  "window_start_epoch": null,
+  "window_end_epoch": null,
+  "config_summary": {
+    "model_id": "qwen3_5_audio_manual_ep",
+    "attn_implementation": "sdpa",
+    "expert_parallel_size": 8,
+    "fully_shard_parallel_size": "auto",
+    "tensor_parallel_size": 1,
+    "ulysses_parallel_size": 1,
+    "recompute": false,
+    "param_dtype": "bf16",
+    "reduce_dtype": "fp32",
+    "micro_batch_size": 2,
+    "gradient_accumulation_steps": 2,
+    "gradient_accumulation_no_sync": true,
+    "empty_cache_interval": 1,
+    "train_iters": 80,
+    "lr": 0.0001,
+    "clip_grad": 1.0,
+    "cutoff_len": 4096,
+    "sampler_type": "LengthBucketBatchSampler",
+    "length_bucket_size_multiplier": 16,
+    "pad_to_multiple_of": 128,
+    "chunk_loss_size": 512,
+    "num_workers": 8,
+    "prefetch_factor": null,
+    "persistent_workers": null,
+    "dataloader_timeout": 120,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05
+  },
+  "runtime_env": {
+    "MULTI_STREAM_MEMORY_REUSE": "2",
+    "TASK_QUEUE_ENABLE": "1",
+    "PYTORCH_NPU_ALLOC_CONF": "max_split_size_mb:512",
+    "ACLNN_CACHE_LIMIT": "100000",
+    "CPU_AFFINITY_CONF": "1",
+    "HCCL_CONNECT_TIMEOUT": "1800"
+  },
+  "measured": {
+    "num_steps": 0,
+    "step_time_s": {
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "min": null,
+      "max": null
+    },
+    "samples": 0,
+    "samples_per_s": null,
+    "input_tokens": 0,
+    "label_tokens": 0,
+    "audio_tokens": 0,
+    "input_wps": null,
+    "label_wps": null,
+    "audio_wps": null,
+    "loss_first": null,
+    "loss_last": null
+  },
+  "phase_timing_ms": {},
+  "run_phase_s": {
+    "startup_to_manual_load": 3.4800000190734863,
+    "qwen_safe_open_load": 30.905999898910522,
+    "whisper_load": 1.3280000686645508,
+    "projector_and_final_barrier": 8.65999984741211
+  },
+  "hardware_window": {
+    "num_samples": 0,
+    "num_chip_rows": 0,
+    "aicore_pct": {
+      "mean": null,
+      "peak": null
+    },
+    "hbm_used_mb": {
+      "mean": null,
+      "peak": null,
+      "p50": null,
+      "p90": null,
+      "total": null
+    },
+    "power_w": {
+      "mean": null,
+      "peak": null
+    }
+  },
+  "hardware_window_active": {
+    "num_samples": 0,
+    "num_chip_rows": 0,
+    "aicore_pct": {
+      "mean": null,
+      "peak": null
+    },
+    "hbm_used_mb": {
+      "mean": null,
+      "peak": null,
+      "p50": null,
+      "p90": null,
+      "total": null
+    },
+    "power_w": {
+      "mean": null,
+      "peak": null
+    }
+  },
+  "hardware_window_per_chip": {},
+  "hardware_all": {
+    "num_samples": 106,
+    "aicore_pct": {
+      "mean": 0.97,
+      "peak": 61.0
+    },
+    "hbm_used_mb": {
+      "mean": 30040.3,
+      "peak": 47912,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 101.01,
+      "peak": 167.1
+    }
+  },
+  "markers": {
+    "first_log": 1781542885.446,
+    "manual_qwen_load_start": 1781542888.926,
+    "manual_qwen_loaded": 1781542919.832,
+    "manual_whisper_loaded": 1781542921.16,
+    "manual_audio_projector_init": 1781542921.22,
+    "manual_load_complete": 1781542929.82,
+    "lora_trainable_fixed": 1781542929.826
+  },
+  "errors": [
+    "W0616 01:04:06.263000 4059301 torch/distributed/elastic/agent/server/api.py:719] Received Signals.SIGTERM death signal, shutting down workers",
+    "W0616 01:04:06.264000 4059301 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4059400 closing signal SIGTERM",
+    "W0616 01:04:06.266000 4059301 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4059401 closing signal SIGTERM",
+    "W0616 01:04:06.276000 4059301 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4059402 closing signal SIGTERM",
+    "W0616 01:04:06.281000 4059301 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4059403 closing signal SIGTERM",
+    "W0616 01:04:06.283000 4059301 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4059404 closing signal SIGTERM",
+    "W0616 01:04:06.292000 4059301 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4059405 closing signal SIGTERM",
+    "W0616 01:04:06.298000 4059301 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4059406 closing signal SIGTERM",
+    "W0616 01:04:06.306000 4059301 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4059407 closing signal SIGTERM",
+    "Traceback (most recent call last):",
+    "raise SignalException(f\"Process {os.getpid()} got signal: {sigval}\", sigval=sigval)",
+    "torch.distributed.elastic.multiprocessing.api.SignalException: Process 4059301 got signal: 15"
+  ],
+  "error_category": "terminated_or_hung"
+}

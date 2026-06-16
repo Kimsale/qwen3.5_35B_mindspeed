@@ -158,3 +158,19 @@ mindspeed
 /tests/st/run_logs/
 
 fusion_result.json
+
+# Qwen3.5 35B local training artifacts
+/MindSpeed/
+/cache_dir/
+/data/
+/logs/
+/save_path*/
+/qwen35_audio_artifacts/data/
+/qwen35_audio_artifacts/logs/
+/qwen35_audio_artifacts/output/
+/qwen35_audio_artifacts/checkpoints/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin

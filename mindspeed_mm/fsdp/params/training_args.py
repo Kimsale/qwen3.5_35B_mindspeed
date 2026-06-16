@@ -63,11 +63,65 @@ class Profiler:
             self.profile_this_rank = False
 
 
+@dataclass
+class ManualEPHFLoad:
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable manual HF safetensors loading for expert-parallel Qwen3.5 MoE."},
+    )
+    qwen_hf_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the Qwen HF checkpoint directory."},
+    )
+    whisper_hf_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the Whisper HF checkpoint directory."},
+    )
+    load_visual: bool = field(
+        default=False,
+        metadata={"help": "Whether to load visual tower weights."},
+    )
+    load_audio: bool = field(
+        default=True,
+        metadata={"help": "Whether to load Whisper audio encoder weights."},
+    )
+    init_audio_projector: bool = field(
+        default=True,
+        metadata={"help": "Whether to initialize audio projector weights."},
+    )
+
+
+@dataclass
+class PerfTiming:
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable per-step phase timing logs for performance analysis."},
+    )
+    sync: bool = field(
+        default=True,
+        metadata={"help": "Synchronize NPU before phase timing boundaries for accurate measurements."},
+    )
+    log_tokens: bool = field(
+        default=True,
+        metadata={"help": "Log global input, label, and audio-pad token counts for WPS calculation."},
+    )
+    log_micro_steps: bool = field(
+        default=False,
+        metadata={"help": "Log rank-0 micro-step phase markers for hang diagnosis."},
+    )
+    diagnostic_sync_phases: List[str] = field(
+        default_factory=list,
+        metadata={"help": "NPU-synchronize after named phases for hang diagnosis. Example: ['forward', 'backward', 'clip']."},
+    )
+
+
 @allow_extra_fields
 @dataclass
 class TrainingArguments:
     profile: Profiler = field(default_factory=Profiler)
     lora: LoraArguments = field(default_factory=LoraArguments)
+    manual_ep_hf_load: ManualEPHFLoad = field(default_factory=ManualEPHFLoad)
+    perf_timing: PerfTiming = field(default_factory=PerfTiming)
     lr: float = field(
         default=5e-5,
         metadata={"help": "Maximum learning rate or defult learning rate, or init learning rate for warmup."},
@@ -127,6 +181,14 @@ class TrainingArguments:
     gradient_accumulation_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Gradient accumulation steps. If None, use `global_batch_size` // (`micro_batch_size` * data_parallel_size)."},
+    )
+    gradient_accumulation_no_sync: bool = field(
+        default=False,
+        metadata={"help": "Use model.no_sync() for non-final micro-steps during gradient accumulation."},
+    )
+    empty_cache_interval: int = field(
+        default=0,
+        metadata={"help": "Call torch.npu.empty_cache() every N optimizer steps. 0 disables it."},
     )
     lr_warmup_ratio: float = field(
         default=0.0,

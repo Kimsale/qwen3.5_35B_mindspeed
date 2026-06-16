@@ -109,9 +109,12 @@ def ep_fsdp2_clip_grad_norm(
 
     if max_norm == 0.:
         return total_norm
-    # Apply the same clip coefficient to both groups
-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach=foreach)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach=foreach)
+    # Apply the same clip coefficient to both groups. LoRA-only training can
+    # legitimately leave one group empty on a rank after EP/FSDP partitioning.
+    if ep_params:
+        torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach=foreach)
+    if non_ep_params:
+        torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach=foreach)
 
     return total_norm
 
@@ -125,6 +128,8 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
     ]
     default_device = grads_local[0].device if len(grads_local) > 0 else torch.device(get_device_type())
     res = torch.tensor(0.0, device=default_device, dtype=torch.float32)
+    if len(grads_local) == 0:
+        return res
     with torch.no_grad():
         grouped_grads_local = _group_tensors_by_device_and_dtype([grads_local])
         for (device, _), ([device_grads_local], _) in grouped_grads_local.items():

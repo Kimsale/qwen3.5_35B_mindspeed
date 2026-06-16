@@ -1,0 +1,166 @@
+parallel:
+  tensor_parallel_size: 1
+  fully_shard_parallel_size: auto
+  fsdp_plan:
+    apply_modules:
+    - model.language_model.layers.{*}.linear_attn
+    - model.language_model.layers.{*}.mlp
+    - model.language_model.layers.{*}
+    - model.language_model.embed_tokens
+    - model.language_model.norm
+    - model.language_model.rotary_emb
+    - model.language_model
+    - audio_tower
+    - audio_projector
+    - lm_head
+    hook_modules:
+    - model.language_model.layers.{*}
+    param_dtype: bf16
+    reduce_dtype: fp32
+  recompute: false
+  recompute_plan:
+    apply_modules: []
+  ulysses_parallel_size: 1
+  expert_parallel_size: 8
+  ep_plan:
+    apply_modules:
+    - model.language_model.layers.{*}.mlp.experts
+  moe_impl_type: qwen3_5
+data:
+  dataset_param:
+    dataset_type: huggingface
+    attr:
+      images: null
+      videos: null
+      audios: audios
+      messages: messages
+      role_tag: role
+      content_tag: content
+      user_tag: user
+      assistant_tag: assistant
+    preprocess_parameters:
+      model_name_or_path: /mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B
+      use_fast_tokenizer: true
+      split_special_tokens: false
+      audio_sampling_rate: 16000
+      audio_feature_extractor_path: /mnt/shared_data_196/sejin/models/whisper-large-v3
+    basic_parameters:
+      cutoff_len: 4096
+      template: qwen3_omni_nothink
+      train_on_prompt: false
+      mask_history: false
+      dataset_dir: /data/sejin/baseline_26/data_audio_distfix_3200
+      dataset: /data/sejin/baseline_26/data_audio_distfix_3200/train.jsonl
+      cache_dir: /data/sejin/baseline_26/data_audio_distfix_3200/cache_ep8_mbs2_ga2_rc_off_pad128_bucket64_fa2_nosync_chunk512_empty4/
+      overwrite_cache: false
+      preprocessing_batch_size: 1000
+      preprocessing_num_workers: 8
+      max_samples: null
+  dataloader_param:
+    pin_memory: true
+    shuffle: true
+    dataloader_mode: sampler
+    drop_last: true
+    sampler_type: LengthBucketBatchSampler
+    num_workers: 8
+    collate_param:
+      model_name: qwen3vl
+      ignore_pad_token_for_loss: true
+      pad_to_multiple_of: 128
+    length_bucket_size_multiplier: 64
+model:
+  model_id: qwen3_5_audio_manual_ep
+  model_name_or_path: /mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B
+  trust_remote_code: true
+  attn_implementation: flash_attention_2
+  whisper_path: /mnt/shared_data_196/sejin/models/whisper-large-v3
+  audio_token_id: 248076
+  audio_projector_act: gelu
+  freeze:
+  - model.visual
+  - audio_tower
+  loss_cfg:
+    loss_type: default
+    router_aux_loss_coef: 0.0
+  enable_chunk_loss: true
+  chunkloss_plan:
+    apply_module: lm_head
+    chunk_size: 512
+  use_triton_gdn: true
+  use_grouped_expert_matmul: true
+training:
+  micro_batch_size: 2
+  gradient_accumulation_steps: 2
+  seed: 42
+  lr: 0.0001
+  lr_decay_style: cosine
+  lr_warmup_ratio: 0.03
+  weight_decay: 0.0
+  train_iters: 80
+  clip_grad: 1.0
+  init_model_with_meta_device: true
+  optimizer: adamw
+  adam_fused: true
+  save_interval: 0
+  no_load_optim: true
+  no_load_rng: true
+  no_save_optim: true
+  no_save_rng: true
+  load: null
+  save: /data/sejin/baseline_26/output/ep8_mbs2_ga2_rc_off_pad128_bucket64_fa2_nosync_chunk512_empty4
+  use_deter_comp: false
+  manual_ep_hf_load:
+    enable: true
+    qwen_hf_dir: /mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B
+    whisper_hf_dir: /mnt/shared_data_196/sejin/models/whisper-large-v3
+    load_visual: false
+    load_audio: true
+    init_audio_projector: true
+  lora:
+    enable: true
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    init_lora_weights: kaiming
+    save_mode: lora_only
+    target_modules:
+    - model.language_model.layers.{*}.self_attn.q_proj
+    - model.language_model.layers.{*}.self_attn.k_proj
+    - model.language_model.layers.{*}.self_attn.v_proj
+    - model.language_model.layers.{*}.self_attn.o_proj
+  plugin:
+  - mindspeed_mm/fsdp/models/qwen3_5_audio
+  - mindspeed_mm/fsdp/data/datasets/huggingface
+  perf_timing:
+    enable: true
+    sync: false
+    log_tokens: true
+  gradient_accumulation_no_sync: true
+  empty_cache_interval: 4
+tools:
+  profile:
+    enable: false
+    profile_type: static
+    ranks:
+    - 0
+    static_param:
+      level: level1
+      with_stack: false
+      with_memory: false
+      record_shapes: false
+      with_cpu: true
+      save_path: ./profiling_distfix60_manual_ep8
+      start_step: 20
+      end_step: 22
+      data_simplification: false
+      aic_metrics_type: PipeUtilization
+  memory_profile:
+    enable: false
+    start_step: 1
+    end_step: 2
+    save_path: ./memory_snapshot_distfix60_manual_ep8
+    dump_ranks:
+    - 0
+    stacks: all
+    max_entries: null
+    mem_info: false

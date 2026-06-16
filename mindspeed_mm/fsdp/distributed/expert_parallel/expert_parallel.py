@@ -30,7 +30,13 @@ def expert_parallelize_modules(modules: torch.nn.Module, ep_mesh: DeviceMesh, pl
 
         # replace forward with ep forward
         if hasattr(module, 'ep_forward') and callable(module.ep_forward):
-            module.forward = partial(module.ep_forward, ep_group=ep_group)
+            # Forward the configured dispatcher (eager/fused/mc2) so the module's
+            # ep_forward can opt into mc2 comm-compute overlap. Defaults preserve
+            # the previous fused behaviour for modules that ignore the kwarg.
+            try:
+                module.forward = partial(module.ep_forward, ep_group=ep_group, dispatcher=plan.dispatcher)
+            except TypeError:
+                module.forward = partial(module.ep_forward, ep_group=ep_group)
         else:
             experts_forward_fn = get_experts_forward_fn_for_qwen(ep_group, dispatcher=plan.dispatcher)
             module.forward = types.MethodType(experts_forward_fn, module)

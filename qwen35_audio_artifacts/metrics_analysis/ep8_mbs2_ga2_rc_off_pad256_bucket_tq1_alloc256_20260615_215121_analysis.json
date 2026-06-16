@@ -1,0 +1,110 @@
+{
+  "tag": "ep8_mbs2_ga2_rc_off_pad256_bucket_tq1_alloc256",
+  "config": "/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_mbs2_ga2_rc_off_pad256_bucket.yaml",
+  "train_log": "/data/sejin/baseline_26/logs/ep8_mbs2_ga2_rc_off_pad256_bucket_tq1_alloc256_20260615_215121.log",
+  "monitor_json": "/data/sejin/baseline_26/metrics/ep8_mbs2_ga2_rc_off_pad256_bucket_tq1_alloc256_20260615_215121_npu_full.json",
+  "skip_steps": 10,
+  "window_start_epoch": null,
+  "window_end_epoch": null,
+  "config_summary": {
+    "model_id": "qwen3_5_audio_manual_ep",
+    "attn_implementation": "sdpa",
+    "expert_parallel_size": 8,
+    "fully_shard_parallel_size": "auto",
+    "tensor_parallel_size": 1,
+    "ulysses_parallel_size": 1,
+    "recompute": false,
+    "param_dtype": "bf16",
+    "reduce_dtype": "fp32",
+    "micro_batch_size": 2,
+    "gradient_accumulation_steps": 2,
+    "train_iters": 80,
+    "lr": 0.0001,
+    "clip_grad": 1.0,
+    "cutoff_len": 4096,
+    "sampler_type": "LengthBucketBatchSampler",
+    "length_bucket_size_multiplier": 64,
+    "pad_to_multiple_of": 256,
+    "num_workers": 8,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05
+  },
+  "measured": {
+    "num_steps": 0,
+    "step_time_s": {
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "min": null,
+      "max": null
+    },
+    "samples": 0,
+    "samples_per_s": null,
+    "input_tokens": 0,
+    "label_tokens": 0,
+    "audio_tokens": 0,
+    "input_wps": null,
+    "label_wps": null,
+    "audio_wps": null,
+    "loss_first": null,
+    "loss_last": null
+  },
+  "phase_timing_ms": {},
+  "run_phase_s": {},
+  "hardware_window": {
+    "num_samples": 0,
+    "aicore_pct": {
+      "mean": null,
+      "peak": null
+    },
+    "hbm_used_mb": {
+      "mean": null,
+      "peak": null,
+      "total": null
+    },
+    "power_w": {
+      "mean": null,
+      "peak": null
+    }
+  },
+  "hardware_all": {
+    "num_samples": 8,
+    "aicore_pct": {
+      "mean": 6.48,
+      "peak": 22.0
+    },
+    "hbm_used_mb": {
+      "mean": 14234.8,
+      "peak": 14431,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 116.07,
+      "peak": 153.3
+    }
+  },
+  "markers": {},
+  "errors": [
+    "Traceback (most recent call last):",
+    "RuntimeError: `max_split_size_mb` or `garbage_collection_threshold`, cannot be enabled with `expandable_segments`, please set `expandable_segments` to `False`.",
+    "Traceback (most recent call last):",
+    "RuntimeError: `max_split_size_mb` or `garbage_collection_threshold`, cannot be enabled with `expandable_segments`, please set `expandable_segments` to `False`.",
+    "Traceback (most recent call last):",
+    "RuntimeError: `max_split_size_mb` or `garbage_collection_threshold`, cannot be enabled with `expandable_segments`, please set `expandable_segments` to `False`.",
+    "Traceback (most recent call last):",
+    "RuntimeError: `max_split_size_mb` or `garbage_collection_threshold`, cannot be enabled with `expandable_segments`, please set `expandable_segments` to `False`.",
+    "Traceback (most recent call last):",
+    "RuntimeError: `max_split_size_mb` or `garbage_collection_threshold`, cannot be enabled with `expandable_segments`, please set `expandable_segments` to `False`.",
+    "Traceback (most recent call last):",
+    "RuntimeError: `max_split_size_mb` or `garbage_collection_threshold`, cannot be enabled with `expandable_segments`, please set `expandable_segments` to `False`.",
+    "Traceback (most recent call last):",
+    "RuntimeError: `max_split_size_mb` or `garbage_collection_threshold`, cannot be enabled with `expandable_segments`, please set `expandable_segments` to `False`.",
+    "Traceback (most recent call last):",
+    "RuntimeError: `max_split_size_mb` or `garbage_collection_threshold`, cannot be enabled with `expandable_segments`, please set `expandable_segments` to `False`.",
+    "Traceback (most recent call last):",
+    "raise ChildFailedError(",
+    "torch.distributed.elastic.multiprocessing.errors.ChildFailedError:"
+  ]
+}

@@ -1,0 +1,125 @@
+{
+  "tag": "ep8_mbs1_ga4_rc_off_pad2048",
+  "config": "/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_mbs1_ga4_rc_off_pad2048.yaml",
+  "train_log": "/data/sejin/baseline_26/logs/ep8_mbs1_ga4_rc_off_pad2048_20260615_224500.log",
+  "monitor_json": "/data/sejin/baseline_26/metrics/ep8_mbs1_ga4_rc_off_pad2048_20260615_224500_npu_full.json",
+  "skip_steps": 10,
+  "window_start_epoch": 1781534884.4119,
+  "window_end_epoch": 1781535033.069,
+  "config_summary": {
+    "model_id": "qwen3_5_audio_manual_ep",
+    "attn_implementation": "sdpa",
+    "expert_parallel_size": 8,
+    "fully_shard_parallel_size": "auto",
+    "tensor_parallel_size": 1,
+    "ulysses_parallel_size": 1,
+    "recompute": false,
+    "param_dtype": "bf16",
+    "reduce_dtype": "fp32",
+    "micro_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "train_iters": 80,
+    "lr": 0.0001,
+    "clip_grad": 1.0,
+    "cutoff_len": 4096,
+    "sampler_type": "BaseRandomBatchSampler",
+    "length_bucket_size_multiplier": null,
+    "pad_to_multiple_of": 2048,
+    "num_workers": 8,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05
+  },
+  "measured": {
+    "num_steps": 20,
+    "step_time_s": {
+      "mean": 7.431994999999999,
+      "median": 5.6166,
+      "p90": 11.04616,
+      "p95": 11.09995,
+      "min": 5.288399999999999,
+      "max": 11.8723
+    },
+    "samples": 640,
+    "samples_per_s": 4.305707955939153,
+    "input_tokens": 110497,
+    "label_tokens": 12368,
+    "audio_tokens": 86991,
+    "input_wps": 743.3872062615759,
+    "label_wps": 83.20780624852412,
+    "audio_wps": 585.2466262423482,
+    "loss_first": 11.25697,
+    "loss_last": 7.702893
+  },
+  "phase_timing_ms": {
+    "backward": 2026.5400000000002,
+    "clip": 182.98,
+    "forward": 4613.4400000000005,
+    "get_batch": 2.0199999999999996,
+    "loss_setup": 0.925,
+    "lr_scheduler": 0.0,
+    "move": 572.2199999999999,
+    "optimizer": 3.925,
+    "pregather": 0.0,
+    "profiler": 0.0,
+    "zero_grad": 0.29999999999999993
+  },
+  "run_phase_s": {
+    "startup_to_manual_load": 3.361999988555908,
+    "qwen_safe_open_load": 33.85800004005432,
+    "whisper_load": 1.5779998302459717,
+    "projector_and_final_barrier": 4.6000001430511475,
+    "post_load_to_iter1_end": 71.85899996757507,
+    "step1_time": 38.8491,
+    "all_logged_steps": 241.11270000000007
+  },
+  "hardware_window": {
+    "num_samples": 70,
+    "aicore_pct": {
+      "mean": 17.57,
+      "peak": 51.0
+    },
+    "hbm_used_mb": {
+      "mean": 63218.5,
+      "peak": 65447,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 151.97,
+      "peak": 216.6
+    }
+  },
+  "hardware_all": {
+    "num_samples": 185,
+    "aicore_pct": {
+      "mean": 10.99,
+      "peak": 72.0
+    },
+    "hbm_used_mb": {
+      "mean": 50894.9,
+      "peak": 65447,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 130.65,
+      "peak": 216.6
+    }
+  },
+  "markers": {
+    "first_log": 1781534715.522,
+    "manual_qwen_load_start": 1781534718.884,
+    "manual_qwen_loaded": 1781534752.742,
+    "manual_whisper_loaded": 1781534754.32,
+    "manual_audio_projector_init": 1781534754.375,
+    "manual_load_complete": 1781534758.92,
+    "lora_trainable_fixed": 1781534758.928
+  },
+  "errors": [
+    "[rank2]:[E615 22:50:43.789041094 compiler_depend.ts:444] NPU out of memory. NPUWorkspaceAllocator tried to allocate 1.89 GiB(NPU 2; 60.96 GiB total capacity; 1.79 GiB free). If you want to reduce memory usage, take a try to set the environment variable TASK_QUEUE_ENABLE=1.",
+    "[rank2]: Traceback (most recent call last):",
+    "[rank2]: RuntimeError: The Inner error is reported as above. The process exits for this inner error, and the current working operator name is aclnnMul.",
+    "Traceback (most recent call last):",
+    "raise ChildFailedError(",
+    "torch.distributed.elastic.multiprocessing.errors.ChildFailedError:"
+  ]
+}

@@ -1,0 +1,206 @@
+# =============================================================================
+# Qwen3.5-35B-A3B  LoRA 微调  最优配置（单机 8×910B3 64GB）
+# 框架: MindSpeed-MM 26.0.0  FSDP2 路线 (NON_MEGATRON=true)
+# 入口: mindspeed_mm/fsdp/train/trainer.py
+#
+# 设计依据:
+#   1. 源码实测开关 (parallel_args.py / lora_args.py / expert_parallel.py)
+#   2. 官方更大配置激进实践 (122B: EP=8; 397B: EP=32 + chunk_loss)
+#   3. 业界 FSDP+MoE 最优实践: 通信重叠 + grouped GEMM + EP 域内通信 + 选择性重计算
+#   4. 目标: 显存打满 50-60G / 卡, AI Core 利用率 ≥70%, 吞吐最大化
+#
+# ⚠️ 前置条件(必须先完成):
+#   a) 模型权重下载完整 (当前 35B 仍在下载中)
+#   b) HF -> DCP 权重转换:
+#      mm-convert Qwen35Converter hf_to_dcp \
+#        --hf_dir <HF权重目录> --dcp_dir ./ckpt/dcp_path/Qwen3.5-35B-A3B
+#   c) 准备数据集 (见 data 段)
+# =============================================================================
+
+# ------------------------------------------------------------------ 并行策略
+parallel:
+  tensor_parallel_size: 1            # 源码强制 TP=1 (parallel_args.py:154), 不可改
+  fully_shard_parallel_size: auto    # = world_size/TP = 8, FSDP 跨 8 卡分片(Zero-3)
+
+  fsdp_plan:
+    apply_modules:                   # FSDP 包裹粒度: 与官方一致, linear_attn/mlp 单独 wrap
+      - model.visual.blocks.{*}
+      - model.visual
+      - model.language_model.layers.{*}.linear_attn
+      - model.language_model.layers.{*}.mlp
+      - model.language_model.layers.{*}
+      - model.language_model.embed_tokens
+      - model.language_model.norm
+      - model.language_model.rotary_emb
+      - model.language_model
+      - lm_head
+    hook_modules:
+      - model.language_model.layers.{*}
+    param_dtype: bf16                # 参数 bf16 (省显存 + 昇腾算力友好)
+    reduce_dtype: fp32               # 梯度规约 fp32 (数值稳定, 与基线数学一致)
+
+    # ===== 优化项1: 通信-计算重叠 (官方默认 0=关; 这里开启) =====
+    # 前/反向各预取下 1 层的 all-gather/reduce-scatter, 与当前层计算重叠
+    # 直接提升 AI Core 利用率, 是吞吐优化的关键开关
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+
+    # Zero-3 行为: true=前向后立即 reshard(省显存); LoRA 基座冻结显存够, 保持 true
+    reshard_after_forward: true
+    pregather: false                 # 预聚合(进一步重叠), 显存紧张时再关; 默认 false
+
+  # ===== 优化项2: 选择性重计算 (官方默认整层全量; 这里只重算专家) =====
+  # 256 专家的 MLP 是激活显存大头且重算便宜 -> 只重算 experts
+  # 注意力/linear_attn 的激活保留 -> 减少重算 FLOPs -> 提升有效吞吐
+  # 若显存不足(OOM), 把 apply_modules 换回整层 model.language_model.layers.{*}
+  recompute: true
+  recompute_plan:
+    apply_modules:
+      - model.language_model.layers.{*}   # 整层全量重计算(省最多激活显存,解决OOM)
+    use_reentrant: false             # 非 reentrant checkpoint(省显存 + 兼容性好)
+
+  ulysses_parallel_size: 1           # 序列并行; seq 较短(1024)时无需, 保持 1
+  ring_attention_size: 1
+
+  # ===== 专家并行 EP: 单机8卡显存紧张,关闭 EP 改用纯 FSDP 全分片(每卡只扛1/8权重) =====
+  # 注: EP=8 时每卡扛 32 个完整专家不分片 -> OOM; EP=1 让专家也走 FSDP 分片更省显存
+  expert_parallel_size: 1
+  ep_plan:
+    apply_modules:
+      - model.language_model.layers.{*}.mlp.experts
+  moe_impl_type: qwen3_5             # 指定 qwen3.5 MoE 实现
+
+# ------------------------------------------------------------------ 数据配置
+data:
+  dataset_param:
+    dataset_type: huggingface
+    attr:
+      messages: messages
+      role_tag: role
+      content_tag: content
+      user_tag: user
+      assistant_tag: assistant
+    preprocess_parameters:
+      model_name_or_path: &HF_MODEL_LOAD_PATH /mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B
+      use_fast_tokenizer: true
+      split_special_tokens: false
+      image_max_pixels: 262144
+      image_min_pixels: 1024
+      video_max_pixels: 16384
+      video_min_pixels: 0
+      video_fps: 2.0
+      video_maxlen: 64
+    basic_parameters:
+      cutoff_len: 1024               # 降到官方默认值，解决OOM(激活显存随seq平方增长)
+      template: qwen3_vl_nothink     # 支持纯文本数据(无图像时 mm_plugin 自动跳过)
+      enable_thinking: false
+      train_on_prompt: false
+      mask_history: false
+      dataset_dir: /data/sejin/baseline_26/data_hulk_dist
+      dataset: &DATASET_PATH /data/sejin/baseline_26/data_hulk_dist/train.jsonl  # hulk SFT 数据 8000条
+      cache_dir: /data/sejin/baseline_26/data_hulk_dist/cache_qwen35/
+      overwrite_cache: false
+      preprocessing_batch_size: 1000
+      preprocessing_num_workers: 16
+      max_samples: null
+  dataloader_param:
+    pin_memory: true
+    shuffle: true
+    dataloader_mode: sampler
+    drop_last: true
+    sampler_type: BaseRandomBatchSampler
+    num_workers: 8
+    collate_param:
+      model_name: qwen3vl
+      ignore_pad_token_for_loss: true
+
+# ------------------------------------------------------------------ 模型配置
+model:
+  model_id: qwen3_5_moe
+  model_name_or_path: *HF_MODEL_LOAD_PATH
+  trust_remote_code: true
+  attn_implementation: sdpa          # 若开 ulysses-cp 需改 flash_attention_2
+  freeze:
+    - model.visual                   # 冻结视觉塔(LoRA 只调语言侧)
+  loss_cfg:
+    loss_type: default
+    router_aux_loss_coef: 0.0        # 负载均衡辅助损失; 保持0与基线数学一致(可调0.001试均衡)
+  enable_chunk_loss: true            # 分块计算 lm_head loss, 省峰值显存(官方397B同款)
+  chunkloss_plan:
+    apply_module: lm_head
+    chunk_size: 1024
+  # ===== 优化项4: MoE 算子级优化 (官方默认已开, 保持) =====
+  use_triton_gdn: true               # Triton gated-delta-net 融合算子(linear_attn 加速)
+  use_grouped_expert_matmul: true    # grouped GEMM: 256专家矩阵批量融合计算, MoE 核心优化
+
+# ------------------------------------------------------------------ 训练配置
+training:
+  micro_batch_size: 1                # 单卡微批; 先 1 跑通, 据显存余量上调到 2
+  gradient_accumulation_steps: 1     # 梯度累积; 显存够时保持1求吞吐, 要大global-bs再上调
+  seed: 42
+  lr: 1.0e-4                         # LoRA 学习率(比全参1e-5高一档, LoRA 常用 1e-4)
+  lr_decay_style: cosine
+  lr_warmup_ratio: 0.1
+  weight_decay: 0.0
+  train_iters: 60                    # 本次测试跑 60 步，采集性能数据
+  clip_grad: 1.0                     # LoRA 建议开梯度裁剪(全参基线为0); 防梯度爆炸
+  init_model_with_meta_device: true  # meta device 初始化, 避免单卡载全量权重 OOM
+  optimizer: adamw
+  adam_fused: true                   # 融合 AdamW(昇腾算子), 提升优化器步耗时
+  save_interval: 10000
+  no_load_optim: true
+  no_load_rng: true
+  no_save_optim: true
+  no_save_rng: true
+  load: /mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B-dcp   # HF->DCP 转换后的目录
+  save: /mnt/shared_data_196/sejin/models/Qwen3.5-35B-lora-ckpt
+  use_deter_comp: false
+
+  # ===== LoRA 配置 (新版 FSDP schema: 挂在 training.lora 下) =====
+  lora:
+    enable: true
+    rank: 16                         # LoRA 秩(与你 baseline_26 对齐: r=16)
+    alpha: 32                        # 缩放(alpha=2*rank 常用; baseline 对齐: 32)
+    dropout: 0.05
+    init_lora_weights: kaiming
+    # target_modules 支持 {*} 通配; 覆盖全注意力(self_attn, 每4层)+ 线性注意力(linear_attn, 每层)
+    # 35B 架构: linear_attn(层0,1,2,4,5,...) + full self_attn(层3,7,11,15,...,39)
+    target_modules:
+      - model.language_model.layers.{*}.self_attn.q_proj      # full attention 层 Q
+      - model.language_model.layers.{*}.self_attn.k_proj      # full attention 层 K
+      - model.language_model.layers.{*}.self_attn.v_proj      # full attention 层 V
+      - model.language_model.layers.{*}.self_attn.o_proj      # full attention 层 O
+      - model.language_model.layers.{*}.linear_attn.in_proj_qkv  # linear attention QKV
+      - model.language_model.layers.{*}.linear_attn.out_proj     # linear attention 输出投影
+    save_mode: lora_only             # 只存 LoRA 适配器(省空间); 要合并权重用 full_model
+
+  plugin:
+    - mindspeed_mm/fsdp/models/qwen3_5_moe
+    - mindspeed_mm/fsdp/data/datasets/huggingface
+
+# ------------------------------------------------------------------ 工具/profiling
+tools:
+  profile:
+    enable: false                    # 采集 AI Core/HBM 指标时设 true(见下方说明)
+    profile_type: static
+    ranks: [0]
+    static_param:
+      level: level1
+      with_stack: false
+      with_memory: false
+      record_shapes: false
+      with_cpu: true
+      save_path: ./profiling
+      start_step: 10
+      end_step: 11
+      data_simplification: false
+      aic_metrics_type: PipeUtilization   # AI Core 利用率指标
+  memory_profile:
+    enable: false                    # 显存分析时设 true, 看是否打满 50-60G
+    start_step: 1
+    end_step: 2
+    save_path: ./memory_snapshot
+    dump_ranks: [0]
+    stacks: all
+    max_entries: null
+    mem_info: false

@@ -1,0 +1,155 @@
+# =============================================================================
+# Qwen3.5-35B-A3B + Whisper-large-v3 语音多模态 LoRA SFT 配置
+# 基于 MindSpeed-MM 26.0.0 官方示例改造
+# 用于 /data/sejin/baseline_26 训练环境
+# =============================================================================
+
+# 并行策略（与之前的 60步成功配置一致）
+parallel:
+  tensor_parallel_size: 1
+  fully_shard_parallel_size: auto  # 自动=8（单机8卡）
+  fsdp_plan:
+    apply_modules:
+      - model.language_model.layers.{*}.linear_attn
+      - model.language_model.layers.{*}.mlp
+      - model.language_model.layers.{*}
+      - model.language_model
+      - model
+    apply_strategy:
+      model.language_model.layers.{*}.linear_attn:
+        shard_param: true
+        shard_grad: true
+        shard_optim: true
+        offload_param: false
+      model.language_model.layers.{*}.mlp:
+        shard_param: true
+        shard_grad: true
+        shard_optim: true
+        offload_param: false
+      model.language_model.layers.{*}:
+        shard_param: true
+        shard_grad: true
+        shard_optim: true
+        offload_param: false
+      model.language_model:
+        shard_param: true
+        shard_grad: true
+        shard_optim: true
+        offload_param: false
+      model:
+        shard_param: true
+        shard_grad: true
+        shard_optim: true
+        offload_param: false
+
+# 模型配置
+model:
+  model_id: qwen3_5_audio  # 音频多模态模型（LLM + Whisper encoder）
+  model_path: /mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B-audio-dcp
+  whisper_path: /mnt/shared_data_196/sejin/models/whisper-large-v3
+  audio_token_id: 151660  # Qwen3.5 的 <|AUDIO|> token
+  template: qwen2_omni     # 支持 <|AUDIO|> 的 prompt 模板
+
+  # 冻结策略（与官方示例一致）
+  freeze:
+    - model.visual  # 冻结 visual encoder（本次不训练视觉）
+    - model.audio_tower  # 冻结 whisper encoder（预训练权重已足够好）
+    # projector 不冻结（全量训练，因为需要适配 whisper → LLM）
+    # language_model 用 LoRA（见下）
+
+# LoRA 配置（仅在 LLM 上打 LoRA）
+lora:
+  enable: true
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:  # 与之前成功的配置一致
+    - model.language_model.layers.{*}.self_attn.q_proj
+    - model.language_model.layers.{*}.self_attn.k_proj
+    - model.language_model.layers.{*}.self_attn.v_proj
+    - model.language_model.layers.{*}.self_attn.o_proj
+    - model.language_model.layers.{*}.linear_attn.in_proj_qkv
+    - model.language_model.layers.{*}.linear_attn.out_proj
+
+# 数据配置
+data:
+  type: audio_text_sft  # 音频+文本 SFT 数据类型
+  train_files:
+    - /data/sejin/baseline_26/data_audio/train.jsonl  # 音频训练数据（需准备）
+  val_files:
+    - /data/sejin/baseline_26/data_audio/val.jsonl    # 验证数据（可选）
+
+  # 数据加载配置
+  num_workers: 4
+  prefetch_factor: 2
+
+  # 音频处理配置
+  audio:
+    sample_rate: 16000      # Whisper 要求 16kHz
+    max_audio_length: 30.0  # 最大音频长度（秒）
+    feature_extractor: whisper  # 使用 Whisper 的特征提取器
+
+# 训练超参（与之前 60步成功配置对齐）
+training:
+  max_steps: 500           # 总训练步数
+  micro_batch_size: 1      # 单卡 micro batch
+  gradient_accumulation_steps: 8  # 累积8步 = global_batch_size 8
+
+  # 优化器
+  optimizer: adamw
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+
+  # 学习率调度
+  lr_scheduler: cosine
+  warmup_steps: 50
+  min_lr: 1.0e-6
+
+  # 梯度裁剪
+  max_grad_norm: 1.0
+
+  # 精度
+  bf16: true
+
+  # checkpoint 保存
+  save_interval: 100       # 每100步保存一次
+  save_dir: /data/sejin/baseline_26/output/qwen35_audio_ckpt
+
+  # 日志
+  log_interval: 1          # 每步打印日志
+  eval_interval: 50        # 每50步评估一次（如果有验证集）
+
+# 序列长度配置
+max_seq_length: 2048       # 文本最大长度（音频 tokens 会额外添加）
+
+# 插件配置（注册 qwen3_5_audio 模型）
+plugin:
+  - mindspeed_mm/fsdp/models/qwen3_5_audio
+  - mindspeed_mm/fsdp/data/datasets/audio_text_sft
+
+# 工具配置（性能分析，可选）
+tools:
+  profile:
+    enable: false
+    profile_type: static
+    ranks: [0]
+    static_param:
+      level: level1
+      with_stack: false
+      with_memory: false
+      record_shapes: false
+      with_cpu: true
+      save_path: /data/sejin/baseline_26/profiling
+      start_step: 10
+      end_step: 11
+
+  memory_profile:
+    enable: false
+    start_step: 1
+    end_step: 2
+    save_path: /data/sejin/baseline_26/memory_snapshot
+    dump_ranks: [0]
+    stacks: all

@@ -948,11 +948,29 @@ class Qwen3_5MoeExperts(nn.Module):
         hidden_states: torch.Tensor,
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
-        ep_group: ProcessGroup
+        ep_group: ProcessGroup,
+        dispatcher: str = "fused"
     ) -> torch.Tensor:
         gate_up_proj = self.gate_up_proj.to_local() if isinstance(self.gate_up_proj, DTensor) else self.gate_up_proj
         down_proj = self.down_proj.to_local() if isinstance(self.down_proj, DTensor) else self.down_proj
 
+        # MC2: fused comm-compute overlap via npu_alltoallv_gmm/npu_gmm_alltoallv
+        if dispatcher == "mc2":
+            from mindspeed.fsdp.distributed.expert_parallel.dispatcher_mc2 import dispatch_mlp_combine
+            hidden_states_shape = hidden_states.shape
+            hidden_states = hidden_states.reshape(-1, hidden_states_shape[-1])
+            hidden_states = dispatch_mlp_combine(
+                ep_group,
+                hidden_states,
+                top_k_index,
+                top_k_weights,
+                weights=(gate_up_proj, down_proj),
+                act_fn=self.act_fn,
+                num_global_experts=self.num_experts,
+            )
+            return hidden_states.view(*hidden_states_shape)
+
+        # Default: existing fused/eager path
         from mindspeed_mm.fsdp.distributed.expert_parallel.ep_dispatcher import ep_forward
         hidden_states = ep_forward(
             self.num_experts,
@@ -961,7 +979,8 @@ class Qwen3_5MoeExperts(nn.Module):
             hidden_states,
             fc1_weight=gate_up_proj,
             fc2_weight=down_proj,
-            ep_group=ep_group
+            ep_group=ep_group,
+            fused=(dispatcher != "eager")
         )
         return hidden_states
 
@@ -993,7 +1012,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         shared_expert_output = self.shared_expert(hidden_states_reshaped)
@@ -1695,7 +1714,18 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
             2. Attending to all inputs
         """
         linear_attn_mask = attention_mask
-        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
+        if self.training:
+            return linear_attn_mask
+
+        cache_position_start = 0
+        if cache_position is not None and cache_position.numel() > 0:
+            cache_position_start = int(cache_position.detach().cpu().flatten()[0].item())
+
+        attention_all_valid = False
+        if attention_mask is not None:
+            attention_all_valid = bool((attention_mask.detach().cpu() == 1).all().item())
+
+        if cache_position_start > 0 or attention_all_valid:
             linear_attn_mask = None
         return linear_attn_mask
 
@@ -2614,9 +2644,6 @@ __all__ = [
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3_5MoePreTrainedModel",
 ]
-
-
-
 
 
 

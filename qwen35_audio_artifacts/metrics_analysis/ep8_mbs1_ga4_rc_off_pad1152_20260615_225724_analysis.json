@@ -1,0 +1,120 @@
+{
+  "tag": "ep8_mbs1_ga4_rc_off_pad1152",
+  "config": "/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_mbs1_ga4_rc_off_pad1152.yaml",
+  "train_log": "/data/sejin/baseline_26/logs/ep8_mbs1_ga4_rc_off_pad1152_20260615_225724.log",
+  "monitor_json": "/data/sejin/baseline_26/metrics/ep8_mbs1_ga4_rc_off_pad1152_20260615_225724_npu_full.json",
+  "skip_steps": 10,
+  "window_start_epoch": 1781535600.9188,
+  "window_end_epoch": 1781535901.382,
+  "config_summary": {
+    "model_id": "qwen3_5_audio_manual_ep",
+    "attn_implementation": "sdpa",
+    "expert_parallel_size": 8,
+    "fully_shard_parallel_size": "auto",
+    "tensor_parallel_size": 1,
+    "ulysses_parallel_size": 1,
+    "recompute": false,
+    "param_dtype": "bf16",
+    "reduce_dtype": "fp32",
+    "micro_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "train_iters": 80,
+    "lr": 0.0001,
+    "clip_grad": 1.0,
+    "cutoff_len": 4096,
+    "sampler_type": "BaseRandomBatchSampler",
+    "length_bucket_size_multiplier": null,
+    "pad_to_multiple_of": 1152,
+    "num_workers": 8,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05
+  },
+  "measured": {
+    "num_steps": 70,
+    "step_time_s": {
+      "mean": 4.291448571428573,
+      "median": 4.1785,
+      "p90": 4.55046,
+      "p95": 4.99916,
+      "min": 4.1516,
+      "max": 5.4303
+    },
+    "samples": 2240,
+    "samples_per_s": 7.456689615960509,
+    "input_tokens": 388084,
+    "label_tokens": 43630,
+    "audio_tokens": 305410,
+    "input_wps": 1291.8847914823295,
+    "label_wps": 145.23900354658795,
+    "audio_wps": 1016.6730248261157,
+    "loss_first": 11.3409,
+    "loss_last": 4.805509
+  },
+  "phase_timing_ms": {
+    "backward": 1569.7614285714294,
+    "clip": 35.64428571428572,
+    "forward": 2513.367142857142,
+    "get_batch": 2.1285714285714286,
+    "loss_setup": 1.067142857142857,
+    "lr_scheduler": 0.0014285714285714286,
+    "move": 135.93285714285716,
+    "optimizer": 3.9085714285714315,
+    "pregather": 0.0,
+    "profiler": 0.0,
+    "zero_grad": 0.31285714285714317
+  },
+  "run_phase_s": {
+    "startup_to_manual_load": 3.4720001220703125,
+    "qwen_safe_open_load": 32.40999984741211,
+    "whisper_load": 1.323000192642212,
+    "projector_and_final_barrier": 9.176999807357788,
+    "post_load_to_iter1_end": 57.10900020599365,
+    "step1_time": 24.1173,
+    "all_logged_steps": 362.4024,
+    "last_step_to_lora_save": 0.10299992561340332
+  },
+  "hardware_window": {
+    "num_samples": 144,
+    "aicore_pct": {
+      "mean": 19.53,
+      "peak": 37.0
+    },
+    "hbm_used_mb": {
+      "mean": 50160.4,
+      "peak": 51317,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 160.35,
+      "peak": 197.9
+    }
+  },
+  "hardware_all": {
+    "num_samples": 240,
+    "aicore_pct": {
+      "mean": 13.96,
+      "peak": 69.0
+    },
+    "hbm_used_mb": {
+      "mean": 42826.1,
+      "peak": 51317,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 140.7,
+      "peak": 197.9
+    }
+  },
+  "markers": {
+    "first_log": 1781535459.534,
+    "manual_qwen_load_start": 1781535463.006,
+    "manual_qwen_loaded": 1781535495.416,
+    "manual_whisper_loaded": 1781535496.739,
+    "manual_audio_projector_init": 1781535496.822,
+    "manual_load_complete": 1781535505.916,
+    "lora_trainable_fixed": 1781535505.922,
+    "save_lora": 1781535901.485
+  },
+  "errors": []
+}

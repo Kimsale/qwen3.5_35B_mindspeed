@@ -1,4 +1,6 @@
 from dataclasses import MISSING, asdict, dataclass, field, fields
+import faulthandler
+import signal
 from typing import Any, Callable, Dict, List, Literal, Optional, TypeVar, Union, get_type_hints
 import logging
 import os
@@ -109,6 +111,10 @@ class Trainer():
     def initialize(self):
         """Initialize training environment: logging, random seeds, distributed groups."""
         args: Arguments = self.args
+        try:
+            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+        except (RuntimeError, ValueError):
+            pass
         print_rank(logger.info, f"Start initializing training environment!!!")
 
         # Set allow_hf32
@@ -160,15 +166,78 @@ class Trainer():
 
         # Initialize weights on meta device if specified (for memory efficiency)
         if args.training.init_model_with_meta_device:
-            if args.training.load is None and args.training.load_rank0_and_broadcast:
+            manual_ep_cfg = getattr(args.training, "manual_ep_hf_load", None)
+            manual_ep_enabled = bool(getattr(manual_ep_cfg, "enable", False))
+            if manual_ep_enabled:
+                to_empty_if_needed(model, device=get_device_type())
+                manual_loader = getattr(model, "load_manual_ep_weights", None)
+                if not callable(manual_loader):
+                    raise ValueError(
+                        "training.manual_ep_hf_load.enable is true, but the selected model "
+                        "does not implement load_manual_ep_weights()."
+                    )
+                manual_loader(args)
+                if args.training.lora.enable:
+                    self._enforce_lora_only_trainable(model)
+                    self._reset_lora_params(model)
+            elif args.training.load is None and args.training.load_rank0_and_broadcast:
                 raise ValueError("Must set `training.load` when `training.load_rank0_and_broadcast` is True, otherwise the model will be initialized with meta device but no weights will be loaded.")
             elif args.training.load is None and not args.training.load_rank0_and_broadcast:
                 to_empty_if_needed(model, device=get_device_type())
                 init_model_weights(model)
             elif not args.training.load_rank0_and_broadcast:
                 to_empty_if_needed(model, device=get_device_type())
+                # FIX: meta_device + DCP load 路径下 to_empty 会把 LoRA 参数初始化为 0
+                # (DCP 里没 LoRA 权重,基模型由后续 DCP load 覆盖,但 LoRA 仍是全 0).
+                # 标准 LoRA 初始化要求 lora_A 用 kaiming 随机,lora_B 保持 0;两者都 0 会
+                # 让 LoRA 输出恒为 0、梯度断流 (grad norm=0,loss 横盘).
+                if args.training.lora.enable:
+                    self._reset_lora_params(model)
 
         return model
+
+    @staticmethod
+    def _enforce_lora_only_trainable(model: torch.nn.Module) -> None:
+        """Keep only LoRA adapter tensors trainable after FSDP/EP wrapping."""
+        trainable = 0
+        total = 0
+        for name, param in model.named_parameters():
+            total += 1
+            is_lora_param = "lora_" in name and "base_layer" not in name
+            param.requires_grad_(is_lora_param)
+            if is_lora_param:
+                trainable += 1
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            logger.info(f"[LoRA fix] post-FSDP trainable tensors: {trainable}/{total} (LoRA only)")
+
+    @staticmethod
+    def _reset_lora_params(model: torch.nn.Module) -> None:
+        """重置 LoRA 适配器参数: lora_A 用 kaiming, lora_B 用小随机值.
+
+        注: 标准 LoRA 用 B=0,但在本框架 (FSDP2 composable + NPU bf16/fp32 混精度
+        + activation checkpoint) 下,B=0 时 lora_out 恒为 0,反向传播链会因数值/计算图
+        优化退化(grad norm=0,LoRA 完全不更新). 经实验验证,改用 small normal (std=0.01)
+        既能让梯度链正常流动,对训练初期影响也极小(初始 |scaling*B*A*x|≈0.01,远小于
+        base_layer 输出量级)."""
+        import math
+        from torch.distributed.tensor import DTensor
+        n_a, n_b = 0, 0
+        for name, param in model.named_parameters():
+            if "lora_A" not in name and "lora_B" not in name:
+                continue
+            with torch.no_grad():
+                # FSDP2 下 LoRA 参数是 DTensor,需要拿 local 张量初始化
+                tgt = param.data.to_local() if isinstance(param.data, DTensor) else param.data
+                if "lora_A" in name:
+                    # PEFT 默认 a=sqrt(5) 的 kaiming_uniform_
+                    torch.nn.init.kaiming_uniform_(tgt, a=math.sqrt(5))
+                    n_a += 1
+                else:  # lora_B
+                    # 关键: B 用小随机值代替 0,避免 FSDP2+NPU 下梯度链退化
+                    torch.nn.init.normal_(tgt, mean=0.0, std=0.01)
+                    n_b += 1
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            logger.info(f"[LoRA fix] re-initialized lora_A={n_a} (kaiming), lora_B={n_b} (small_normal std=0.01)")
 
     def enable_lora(self, model: torch.nn.Module) -> torch.nn.Module:
         """

@@ -1,0 +1,113 @@
+{
+  "tag": "ep8_mbs2_ga2_rc_off_pad512_bucket",
+  "config": "/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_mbs2_ga2_rc_off_pad512_bucket.yaml",
+  "train_log": "/data/sejin/baseline_26/logs/ep8_mbs2_ga2_rc_off_pad512_bucket_20260615_214250.log",
+  "monitor_json": "/data/sejin/baseline_26/metrics/ep8_mbs2_ga2_rc_off_pad512_bucket_20260615_214250_npu_full.json",
+  "skip_steps": 10,
+  "window_start_epoch": null,
+  "window_end_epoch": null,
+  "config_summary": {
+    "model_id": "qwen3_5_audio_manual_ep",
+    "attn_implementation": "sdpa",
+    "expert_parallel_size": 8,
+    "fully_shard_parallel_size": "auto",
+    "tensor_parallel_size": 1,
+    "ulysses_parallel_size": 1,
+    "recompute": false,
+    "param_dtype": "bf16",
+    "reduce_dtype": "fp32",
+    "micro_batch_size": 2,
+    "gradient_accumulation_steps": 2,
+    "train_iters": 80,
+    "lr": 0.0001,
+    "clip_grad": 1.0,
+    "cutoff_len": 4096,
+    "sampler_type": "LengthBucketBatchSampler",
+    "length_bucket_size_multiplier": 64,
+    "pad_to_multiple_of": 512,
+    "num_workers": 8,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05
+  },
+  "measured": {
+    "num_steps": 0,
+    "step_time_s": {
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "min": null,
+      "max": null
+    },
+    "samples": 0,
+    "samples_per_s": null,
+    "input_tokens": 0,
+    "label_tokens": 0,
+    "audio_tokens": 0,
+    "input_wps": null,
+    "label_wps": null,
+    "audio_wps": null,
+    "loss_first": null,
+    "loss_last": null
+  },
+  "phase_timing_ms": {},
+  "run_phase_s": {
+    "startup_to_manual_load": 3.4760000705718994,
+    "qwen_safe_open_load": 33.509000062942505,
+    "whisper_load": 1.3199999332427979,
+    "projector_and_final_barrier": 7.055000066757202,
+    "post_load_to_iter1_end": 69.81699991226196,
+    "step1_time": 32.9318,
+    "all_logged_steps": 35.259100000000004
+  },
+  "hardware_window": {
+    "num_samples": 0,
+    "aicore_pct": {
+      "mean": null,
+      "peak": null
+    },
+    "hbm_used_mb": {
+      "mean": null,
+      "peak": null,
+      "total": null
+    },
+    "power_w": {
+      "mean": null,
+      "peak": null
+    }
+  },
+  "hardware_all": {
+    "num_samples": 84,
+    "aicore_pct": {
+      "mean": 7.43,
+      "peak": 72.0
+    },
+    "hbm_used_mb": {
+      "mean": 39960.1,
+      "peak": 63849,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 117.08,
+      "peak": 211.0
+    }
+  },
+  "markers": {
+    "first_log": 1781530985.353,
+    "manual_qwen_load_start": 1781530988.829,
+    "manual_qwen_loaded": 1781531022.338,
+    "manual_whisper_loaded": 1781531023.658,
+    "manual_audio_projector_init": 1781531023.714,
+    "manual_load_complete": 1781531030.713,
+    "lora_trainable_fixed": 1781531030.719
+  },
+  "errors": [
+    "[rank7]: Traceback (most recent call last):",
+    "[rank7]: RuntimeError: NPU out of memory. Tried to allocate 1.90 GiB (NPU 7; 60.96 GiB total capacity; 46.97 GiB already allocated; 46.97 GiB current active; 1.65 GiB free; 47.25 GiB reserved in total by PyTorch) If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.",
+    "[ERROR] 2026-06-15-21:45:45 (PID:3734596, Device:7, RankID:-1) ERR99999 UNKNOWN applicaiton exception",
+    "Traceback (most recent call last):",
+    "raise ChildFailedError(",
+    "torch.distributed.elastic.multiprocessing.errors.ChildFailedError:"
+  ]
+}

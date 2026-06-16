@@ -1,0 +1,150 @@
+data:
+  dataloader_param:
+    collate_param:
+      ignore_pad_token_for_loss: true
+      model_name: qwen3vl
+    dataloader_mode: sampler
+    drop_last: true
+    num_workers: 8
+    pin_memory: true
+    sampler_type: BaseRandomBatchSampler
+    shuffle: true
+  dataset_param:
+    attr:
+      assistant_tag: assistant
+      audios: audios
+      content_tag: content
+      images: null
+      messages: messages
+      role_tag: role
+      user_tag: user
+      videos: null
+    basic_parameters:
+      cache_dir: /data/sejin/baseline_26/data_audio/cache_dist100/
+      cutoff_len: 4096
+      dataset: /data/sejin/baseline_26/data_audio/train.jsonl
+      dataset_dir: /data/sejin/baseline_26/data_audio
+      mask_history: false
+      max_samples: null
+      overwrite_cache: false
+      preprocessing_batch_size: 1000
+      preprocessing_num_workers: 8
+      template: qwen3_omni_nothink
+      train_on_prompt: false
+    dataset_type: huggingface
+    preprocess_parameters:
+      audio_feature_extractor_path: /mnt/shared_data_196/sejin/models/whisper-large-v3
+      audio_sampling_rate: 16000
+      model_name_or_path: /mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B
+      split_special_tokens: false
+      use_fast_tokenizer: true
+model:
+  attn_implementation: sdpa
+  audio_projector_act: gelu
+  audio_token_id: 248076
+  chunkloss_plan:
+    apply_module: lm_head
+    chunk_size: 1024
+  enable_chunk_loss: true
+  freeze:
+  - model.visual
+  - audio_tower
+  loss_cfg:
+    loss_type: default
+    router_aux_loss_coef: 0.0
+  model_id: qwen3_5_audio
+  model_name_or_path: /mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B
+  trust_remote_code: true
+  use_grouped_expert_matmul: true
+  use_triton_gdn: true
+  whisper_path: /mnt/shared_data_196/sejin/models/whisper-large-v3
+parallel:
+  ep_plan:
+    apply_modules:
+    - model.language_model.layers.{*}.mlp.experts
+  expert_parallel_size: 1
+  fsdp_plan:
+    apply_modules:
+    - model.language_model.layers.{*}.linear_attn
+    - model.language_model.layers.{*}.mlp
+    - model.language_model.embed_tokens
+    - model.language_model.norm
+    - model.language_model.rotary_emb
+    - model.language_model
+    - audio_tower
+    - audio_projector
+    - lm_head
+    hook_modules:
+    - model.language_model.layers.{*}
+    param_dtype: bf16
+    reduce_dtype: fp32
+  fully_shard_parallel_size: auto
+  recompute: false
+  recompute_plan:
+    apply_modules:
+    - model.language_model.layers.{*}
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+tools:
+  memory_profile:
+    dump_ranks:
+    - 0
+    enable: false
+    end_step: 2
+    max_entries: null
+    mem_info: false
+    save_path: ./memory_snapshot
+    stacks: all
+    start_step: 1
+  profile:
+    enable: false
+    profile_type: static
+    ranks:
+    - 0
+    static_param:
+      aic_metrics_type: PipeUtilization
+      data_simplification: false
+      end_step: 11
+      level: level1
+      record_shapes: false
+      save_path: ./profiling
+      start_step: 10
+      with_cpu: true
+      with_memory: false
+      with_stack: false
+training:
+  adam_fused: true
+  clip_grad: 1.0
+  gradient_accumulation_steps: 4
+  init_model_with_meta_device: true
+  load: /mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B-audio-dcp
+  lora:
+    alpha: 32
+    dropout: 0.05
+    enable: true
+    init_lora_weights: kaiming
+    rank: 16
+    save_mode: lora_only
+    target_modules:
+    - model.language_model.layers.{*}.self_attn.q_proj
+    - model.language_model.layers.{*}.self_attn.k_proj
+    - model.language_model.layers.{*}.self_attn.v_proj
+    - model.language_model.layers.{*}.self_attn.o_proj
+  lr: 0.0001
+  lr_decay_style: cosine
+  lr_warmup_ratio: 0.03
+  micro_batch_size: 1
+  no_load_optim: true
+  no_load_rng: true
+  no_save_optim: true
+  no_save_rng: true
+  optimizer: adamw
+  plugin:
+  - mindspeed_mm/fsdp/models/qwen3_5_audio
+  - mindspeed_mm/fsdp/data/datasets/huggingface
+  save: /data/sejin/baseline_26/output/ckpt_audio_dist100
+  save_interval: 10
+  seed: 42
+  train_iters: 3
+  use_deter_comp: false
+  weight_decay: 0.0

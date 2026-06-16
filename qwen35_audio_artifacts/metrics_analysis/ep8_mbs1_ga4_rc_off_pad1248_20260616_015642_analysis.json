@@ -1,0 +1,354 @@
+{
+  "tag": "ep8_mbs1_ga4_rc_off_pad1248",
+  "config": "/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_mbs1_ga4_rc_off_pad1248.yaml",
+  "train_log": "/data/sejin/baseline_26/logs/ep8_mbs1_ga4_rc_off_pad1248_20260616_015642.log",
+  "monitor_json": "/data/sejin/baseline_26/metrics/ep8_mbs1_ga4_rc_off_pad1248_20260616_015642_npu_full.json",
+  "skip_steps": 10,
+  "window_start_epoch": 1781546360.5691998,
+  "window_end_epoch": 1781546669.556,
+  "config_summary": {
+    "model_id": "qwen3_5_audio_manual_ep",
+    "attn_implementation": "sdpa",
+    "expert_parallel_size": 8,
+    "fully_shard_parallel_size": "auto",
+    "tensor_parallel_size": 1,
+    "ulysses_parallel_size": 1,
+    "recompute": false,
+    "param_dtype": "bf16",
+    "reduce_dtype": "fp32",
+    "micro_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "gradient_accumulation_no_sync": false,
+    "empty_cache_interval": 0,
+    "train_iters": 80,
+    "lr": 0.0001,
+    "clip_grad": 1.0,
+    "cutoff_len": 4096,
+    "sampler_type": "BaseRandomBatchSampler",
+    "length_bucket_size_multiplier": null,
+    "pad_to_multiple_of": 1248,
+    "chunk_loss_size": 1024,
+    "num_workers": 8,
+    "prefetch_factor": null,
+    "persistent_workers": null,
+    "dataloader_timeout": null,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05
+  },
+  "runtime_env": {
+    "MULTI_STREAM_MEMORY_REUSE": "2",
+    "TASK_QUEUE_ENABLE": "2",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "ACLNN_CACHE_LIMIT": "100000",
+    "CPU_AFFINITY_CONF": "1",
+    "HCCL_CONNECT_TIMEOUT": "1800"
+  },
+  "measured": {
+    "num_steps": 70,
+    "step_time_s": {
+      "mean": 4.413194285714283,
+      "median": 4.3304,
+      "p90": 4.64289,
+      "p95": 5.175479999999999,
+      "min": 4.301699999999999,
+      "max": 5.33
+    },
+    "samples": 2240,
+    "samples_per_s": 7.250983738374152,
+    "input_tokens": 388084,
+    "label_tokens": 43630,
+    "audio_tokens": 305410,
+    "input_wps": 1256.2458808585689,
+    "label_wps": 141.23233058270725,
+    "audio_wps": 988.6263140789507,
+    "loss_first": 11.26288,
+    "loss_last": 5.102761
+  },
+  "phase_timing_ms": {
+    "backward": 1613.9828571428573,
+    "clip": 45.640000000000015,
+    "empty_cache": 0.0,
+    "forward": 2550.9814285714283,
+    "get_batch": 1.9899999999999993,
+    "loss_setup": 1.0228571428571427,
+    "lr_scheduler": 0.0,
+    "move": 166.31428571428572,
+    "optimizer": 3.960000000000001,
+    "pregather": 0.0,
+    "profiler": 0.0,
+    "zero_grad": 0.31285714285714317
+  },
+  "run_phase_s": {
+    "startup_to_manual_load": 3.5239999294281006,
+    "qwen_safe_open_load": 30.125999927520752,
+    "whisper_load": 1.2599999904632568,
+    "projector_and_final_barrier": 8.70300006866455,
+    "post_load_to_iter1_end": 59.943000078201294,
+    "step1_time": 24.0247,
+    "all_logged_steps": 372.2653,
+    "warmup_logged_steps": 63.34169999999999,
+    "measured_logged_steps": 308.9236000000001,
+    "last_step_to_lora_save": 0.10100007057189941
+  },
+  "hardware_window": {
+    "num_samples": 147,
+    "num_chip_rows": 1176,
+    "aicore_pct": {
+      "mean": 22.17,
+      "p50": 17.0,
+      "p90": 33.0,
+      "peak": 39.0
+    },
+    "hbm_used_mb": {
+      "mean": 51503.2,
+      "p50": 51441.0,
+      "p90": 52762.0,
+      "peak": 52782,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 163.42,
+      "p50": 163.35,
+      "p90": 179.25,
+      "peak": 199.0
+    }
+  },
+  "hardware_window_active": {
+    "num_samples": 147,
+    "num_chip_rows": 1176,
+    "aicore_pct": {
+      "mean": 22.17,
+      "p50": 17.0,
+      "p90": 33.0,
+      "peak": 39.0
+    },
+    "hbm_used_mb": {
+      "mean": 51503.2,
+      "p50": 51441.0,
+      "p90": 52762.0,
+      "peak": 52782,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 163.42,
+      "p50": 163.35,
+      "p90": 179.25,
+      "peak": 199.0
+    }
+  },
+  "hardware_window_per_chip": {
+    "0": {
+      "num_samples": 147,
+      "num_chip_rows": 147,
+      "aicore_pct": {
+        "mean": 23.6,
+        "p50": 27.0,
+        "p90": 32.4,
+        "peak": 38.0
+      },
+      "hbm_used_mb": {
+        "mean": 51386.1,
+        "p50": 51390,
+        "p90": 51390.0,
+        "peak": 51391,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 165.3,
+        "p50": 166.8,
+        "p90": 182.84,
+        "peak": 192.6
+      }
+    },
+    "1": {
+      "num_samples": 147,
+      "num_chip_rows": 147,
+      "aicore_pct": {
+        "mean": 23.22,
+        "p50": 27.0,
+        "p90": 33.0,
+        "peak": 37.0
+      },
+      "hbm_used_mb": {
+        "mean": 51456.6,
+        "p50": 51482,
+        "p90": 51482.0,
+        "peak": 51482,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 169.54,
+        "p50": 170.2,
+        "p90": 186.82,
+        "peak": 199.0
+      }
+    },
+    "2": {
+      "num_samples": 147,
+      "num_chip_rows": 147,
+      "aicore_pct": {
+        "mean": 23.86,
+        "p50": 26.0,
+        "p90": 34.0,
+        "peak": 39.0
+      },
+      "hbm_used_mb": {
+        "mean": 52770.2,
+        "p50": 52762,
+        "p90": 52782.0,
+        "peak": 52782,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 162.18,
+        "p50": 161.7,
+        "p90": 175.26,
+        "peak": 190.7
+      }
+    },
+    "3": {
+      "num_samples": 147,
+      "num_chip_rows": 147,
+      "aicore_pct": {
+        "mean": 22.29,
+        "p50": 22.0,
+        "p90": 33.0,
+        "peak": 37.0
+      },
+      "hbm_used_mb": {
+        "mean": 51440.7,
+        "p50": 51441,
+        "p90": 51441.0,
+        "peak": 51441,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 162.62,
+        "p50": 161.7,
+        "p90": 177.2,
+        "peak": 197.5
+      }
+    },
+    "4": {
+      "num_samples": 147,
+      "num_chip_rows": 147,
+      "aicore_pct": {
+        "mean": 21.57,
+        "p50": 17.0,
+        "p90": 32.0,
+        "peak": 37.0
+      },
+      "hbm_used_mb": {
+        "mean": 51372.5,
+        "p50": 51502,
+        "p90": 51503.0,
+        "peak": 51503,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 158.69,
+        "p50": 159.5,
+        "p90": 175.2,
+        "peak": 192.0
+      }
+    },
+    "5": {
+      "num_samples": 147,
+      "num_chip_rows": 147,
+      "aicore_pct": {
+        "mean": 20.87,
+        "p50": 16.0,
+        "p90": 33.0,
+        "peak": 38.0
+      },
+      "hbm_used_mb": {
+        "mean": 51097.7,
+        "p50": 51160,
+        "p90": 51160.0,
+        "peak": 51160,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 165.02,
+        "p50": 164.8,
+        "p90": 180.34,
+        "peak": 195.9
+      }
+    },
+    "6": {
+      "num_samples": 147,
+      "num_chip_rows": 147,
+      "aicore_pct": {
+        "mean": 20.96,
+        "p50": 17.0,
+        "p90": 32.0,
+        "peak": 38.0
+      },
+      "hbm_used_mb": {
+        "mean": 50879.5,
+        "p50": 50819,
+        "p90": 51058.0,
+        "peak": 51058,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 163.07,
+        "p50": 163.2,
+        "p90": 178.22,
+        "peak": 197.3
+      }
+    },
+    "7": {
+      "num_samples": 147,
+      "num_chip_rows": 147,
+      "aicore_pct": {
+        "mean": 20.97,
+        "p50": 17.0,
+        "p90": 32.0,
+        "peak": 38.0
+      },
+      "hbm_used_mb": {
+        "mean": 51622.6,
+        "p50": 51600,
+        "p90": 51680.0,
+        "peak": 51680,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 160.95,
+        "p50": 158.7,
+        "p90": 178.54,
+        "peak": 190.5
+      }
+    }
+  },
+  "hardware_all": {
+    "num_samples": 244,
+    "aicore_pct": {
+      "mean": 15.67,
+      "peak": 69.0
+    },
+    "hbm_used_mb": {
+      "mean": 44034.5,
+      "peak": 52782,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 142.97,
+      "peak": 199.0
+    }
+  },
+  "markers": {
+    "first_log": 1781546217.686,
+    "manual_qwen_load_start": 1781546221.21,
+    "manual_qwen_loaded": 1781546251.336,
+    "manual_whisper_loaded": 1781546252.596,
+    "manual_audio_projector_init": 1781546252.649,
+    "manual_load_complete": 1781546261.299,
+    "lora_trainable_fixed": 1781546261.305,
+    "save_lora": 1781546669.657
+  },
+  "errors": [],
+  "error_category": "none"
+}

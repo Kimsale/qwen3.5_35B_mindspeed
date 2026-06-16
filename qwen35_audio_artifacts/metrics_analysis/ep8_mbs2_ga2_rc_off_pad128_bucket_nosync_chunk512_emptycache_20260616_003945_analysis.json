@@ -1,0 +1,362 @@
+{
+  "tag": "ep8_mbs2_ga2_rc_off_pad128_bucket_nosync_chunk512_emptycache",
+  "config": "/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_mbs2_ga2_rc_off_pad128_bucket_nosync_chunk512_emptycache.yaml",
+  "train_log": "/data/sejin/baseline_26/logs/ep8_mbs2_ga2_rc_off_pad128_bucket_nosync_chunk512_emptycache_20260616_003945.log",
+  "monitor_json": "/data/sejin/baseline_26/metrics/ep8_mbs2_ga2_rc_off_pad128_bucket_nosync_chunk512_emptycache_20260616_003945_npu_full.json",
+  "skip_steps": 10,
+  "window_start_epoch": 1781541719.9656,
+  "window_end_epoch": 1781541754.39,
+  "config_summary": {
+    "model_id": "qwen3_5_audio_manual_ep",
+    "attn_implementation": "sdpa",
+    "expert_parallel_size": 8,
+    "fully_shard_parallel_size": "auto",
+    "tensor_parallel_size": 1,
+    "ulysses_parallel_size": 1,
+    "recompute": false,
+    "param_dtype": "bf16",
+    "reduce_dtype": "fp32",
+    "micro_batch_size": 2,
+    "gradient_accumulation_steps": 2,
+    "gradient_accumulation_no_sync": true,
+    "empty_cache_interval": 1,
+    "train_iters": 80,
+    "lr": 0.0001,
+    "clip_grad": 1.0,
+    "cutoff_len": 4096,
+    "sampler_type": "LengthBucketBatchSampler",
+    "length_bucket_size_multiplier": 64,
+    "pad_to_multiple_of": 128,
+    "chunk_loss_size": 512,
+    "num_workers": 8,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05
+  },
+  "runtime_env": {
+    "MULTI_STREAM_MEMORY_REUSE": "2",
+    "TASK_QUEUE_ENABLE": "1",
+    "PYTORCH_NPU_ALLOC_CONF": "max_split_size_mb:512",
+    "ACLNN_CACHE_LIMIT": "100000",
+    "CPU_AFFINITY_CONF": "1",
+    "HCCL_CONNECT_TIMEOUT": "1800"
+  },
+  "measured": {
+    "num_steps": 14,
+    "step_time_s": {
+      "mean": 2.4580142857142855,
+      "median": 2.37655,
+      "p90": 2.4385399999999997,
+      "p95": 2.8666599999999995,
+      "min": 2.2882,
+      "max": 3.636
+    },
+    "samples": 448,
+    "samples_per_s": 13.018638738586898,
+    "input_tokens": 89214,
+    "label_tokens": 8799,
+    "audio_tokens": 72541,
+    "input_wps": 2592.510795589936,
+    "label_wps": 255.69420147505826,
+    "audio_wps": 2108.002394499625,
+    "loss_first": 11.466,
+    "loss_last": 9.355334
+  },
+  "phase_timing_ms": {
+    "backward": 958.0,
+    "clip": 24.171428571428574,
+    "empty_cache": 124.69285714285715,
+    "forward": 1293.7000000000003,
+    "get_batch": 0.9357142857142858,
+    "loss_setup": 0.8714285714285717,
+    "lr_scheduler": 0.0,
+    "move": 18.821428571428577,
+    "optimizer": 7.135714285714286,
+    "pregather": 0.0,
+    "profiler": 0.0,
+    "zero_grad": 0.29999999999999993
+  },
+  "run_phase_s": {
+    "startup_to_manual_load": 3.5379998683929443,
+    "qwen_safe_open_load": 32.449000120162964,
+    "whisper_load": 1.303999900817871,
+    "projector_and_final_barrier": 6.74399995803833,
+    "post_load_to_iter1_end": 53.33500003814697,
+    "step1_time": 21.382900000000003,
+    "all_logged_steps": 77.89609999999999,
+    "warmup_logged_steps": 43.48389999999999,
+    "measured_logged_steps": 34.4122
+  },
+  "hardware_window": {
+    "num_samples": 17,
+    "num_chip_rows": 136,
+    "aicore_pct": {
+      "mean": 12.57,
+      "p50": 11.5,
+      "p90": 24.0,
+      "peak": 45.0
+    },
+    "hbm_used_mb": {
+      "mean": 43658.0,
+      "p50": 43784.0,
+      "p90": 52785.0,
+      "peak": 65190,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 148.14,
+      "p50": 147.45,
+      "p90": 167.3,
+      "peak": 189.2
+    }
+  },
+  "hardware_window_active": {
+    "num_samples": 17,
+    "num_chip_rows": 136,
+    "aicore_pct": {
+      "mean": 12.57,
+      "p50": 11.5,
+      "p90": 24.0,
+      "peak": 45.0
+    },
+    "hbm_used_mb": {
+      "mean": 43658.0,
+      "p50": 43784.0,
+      "p90": 52785.0,
+      "peak": 65190,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 148.14,
+      "p50": 147.45,
+      "p90": 167.3,
+      "peak": 189.2
+    }
+  },
+  "hardware_window_per_chip": {
+    "0": {
+      "num_samples": 17,
+      "num_chip_rows": 17,
+      "aicore_pct": {
+        "mean": 12.76,
+        "p50": 12.0,
+        "p90": 17.6,
+        "peak": 45.0
+      },
+      "hbm_used_mb": {
+        "mean": 44149.2,
+        "p50": 42583,
+        "p90": 51872.0,
+        "peak": 61519,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 146.28,
+        "p50": 142.7,
+        "p90": 161.9,
+        "peak": 189.2
+      }
+    },
+    "1": {
+      "num_samples": 17,
+      "num_chip_rows": 17,
+      "aicore_pct": {
+        "mean": 12.47,
+        "p50": 13.0,
+        "p90": 23.8,
+        "peak": 35.0
+      },
+      "hbm_used_mb": {
+        "mean": 44480.4,
+        "p50": 43823,
+        "p90": 49387.8,
+        "peak": 63108,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 151.33,
+        "p50": 152.5,
+        "p90": 172.48,
+        "peak": 183.8
+      }
+    },
+    "2": {
+      "num_samples": 17,
+      "num_chip_rows": 17,
+      "aicore_pct": {
+        "mean": 11.06,
+        "p50": 9.0,
+        "p90": 20.0,
+        "peak": 20.0
+      },
+      "hbm_used_mb": {
+        "mean": 43430.3,
+        "p50": 43784,
+        "p90": 49587.2,
+        "peak": 62735,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 143.52,
+        "p50": 142.0,
+        "p90": 161.68,
+        "peak": 167.6
+      }
+    },
+    "3": {
+      "num_samples": 17,
+      "num_chip_rows": 17,
+      "aicore_pct": {
+        "mean": 13.35,
+        "p50": 12.0,
+        "p90": 26.4,
+        "peak": 32.0
+      },
+      "hbm_used_mb": {
+        "mean": 42801.0,
+        "p50": 43784,
+        "p90": 49368.4,
+        "peak": 64962,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 145.95,
+        "p50": 152.1,
+        "p90": 158.56,
+        "peak": 170.9
+      }
+    },
+    "4": {
+      "num_samples": 17,
+      "num_chip_rows": 17,
+      "aicore_pct": {
+        "mean": 13.82,
+        "p50": 15.0,
+        "p90": 25.0,
+        "peak": 31.0
+      },
+      "hbm_used_mb": {
+        "mean": 43524.1,
+        "p50": 45782,
+        "p90": 51448.8,
+        "peak": 65190,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 146.49,
+        "p50": 146.5,
+        "p90": 162.28,
+        "peak": 168.6
+      }
+    },
+    "5": {
+      "num_samples": 17,
+      "num_chip_rows": 17,
+      "aicore_pct": {
+        "mean": 15.0,
+        "p50": 14.0,
+        "p90": 23.8,
+        "peak": 43.0
+      },
+      "hbm_used_mb": {
+        "mean": 44240.0,
+        "p50": 47403,
+        "p90": 52461.8,
+        "peak": 64887,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 155.96,
+        "p50": 158.0,
+        "p90": 174.38,
+        "peak": 178.2
+      }
+    },
+    "6": {
+      "num_samples": 17,
+      "num_chip_rows": 17,
+      "aicore_pct": {
+        "mean": 11.94,
+        "p50": 7.0,
+        "p90": 24.4,
+        "peak": 31.0
+      },
+      "hbm_used_mb": {
+        "mean": 43940.2,
+        "p50": 47635,
+        "p90": 52888.2,
+        "peak": 65125,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 150.45,
+        "p50": 151.7,
+        "p90": 171.36,
+        "peak": 175.2
+      }
+    },
+    "7": {
+      "num_samples": 17,
+      "num_chip_rows": 17,
+      "aicore_pct": {
+        "mean": 10.18,
+        "p50": 7.0,
+        "p90": 24.0,
+        "peak": 28.0
+      },
+      "hbm_used_mb": {
+        "mean": 42698.8,
+        "p50": 42676,
+        "p90": 53030.2,
+        "peak": 64264,
+        "total": 65536
+      },
+      "power_w": {
+        "mean": 145.19,
+        "p50": 144.4,
+        "p90": 162.92,
+        "peak": 173.2
+      }
+    }
+  },
+  "hardware_all": {
+    "num_samples": 147,
+    "aicore_pct": {
+      "mean": 2.68,
+      "peak": 64.0
+    },
+    "hbm_used_mb": {
+      "mean": 28943.1,
+      "peak": 65190,
+      "total": 65536
+    },
+    "power_w": {
+      "mean": 109.59,
+      "peak": 196.6
+    }
+  },
+  "markers": {
+    "first_log": 1781541600.482,
+    "manual_qwen_load_start": 1781541604.02,
+    "manual_qwen_loaded": 1781541636.469,
+    "manual_whisper_loaded": 1781541637.773,
+    "manual_audio_projector_init": 1781541637.824,
+    "manual_load_complete": 1781541644.517,
+    "lora_trainable_fixed": 1781541644.523
+  },
+  "errors": [
+    "W0616 00:44:57.731000 4026234 torch/distributed/elastic/agent/server/api.py:719] Received Signals.SIGTERM death signal, shutting down workers",
+    "W0616 00:44:57.732000 4026234 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4026322 closing signal SIGTERM",
+    "W0616 00:44:57.733000 4026234 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4026323 closing signal SIGTERM",
+    "W0616 00:44:57.742000 4026234 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4026324 closing signal SIGTERM",
+    "W0616 00:44:57.749000 4026234 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4026325 closing signal SIGTERM",
+    "W0616 00:44:57.758000 4026234 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4026326 closing signal SIGTERM",
+    "W0616 00:44:57.764000 4026234 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4026327 closing signal SIGTERM",
+    "W0616 00:44:57.773000 4026234 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4026328 closing signal SIGTERM",
+    "W0616 00:44:57.785000 4026234 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 4026329 closing signal SIGTERM",
+    "Traceback (most recent call last):",
+    "raise SignalException(f\"Process {os.getpid()} got signal: {sigval}\", sigval=sigval)",
+    "torch.distributed.elastic.multiprocessing.api.SignalException: Process 4026234 got signal: 15"
+  ],
+  "error_category": "terminated_or_hung"
+}

@@ -1,0 +1,4 @@
+{"id": "asr_demo_0001", "audios": ["./data/audio/sample_0001.wav"], "messages": [{"role": "user", "content": "<|AUDIO|>\n请把这段语音转写成文字。"}, {"role": "assistant", "content": "今天天气很好，我们一起去公园散步吧。"}]}
+{"id": "asr_demo_0002", "audios": ["./data/audio/sample_0002.wav"], "messages": [{"role": "user", "content": "<|AUDIO|>\n这段音频说了什么？"}, {"role": "assistant", "content": "会议定于下周三上午十点在三号会议室召开。"}]}
+{"id": "sft_demo_0003", "audios": ["./data/audio/sample_0003.wav"], "messages": [{"role": "user", "content": "<|AUDIO|>\n听完这段语音，请总结说话人的主要诉求。"}, {"role": "assistant", "content": "说话人希望尽快收到退款，并询问处理进度。"}]}
+{"id": "text_only_0004", "messages": [{"role": "user", "content": "用一句话解释什么是语音识别。"}, {"role": "assistant", "content": "语音识别是把人说的话自动转换成对应文字的技术。"}]}

@@ -86,6 +86,15 @@ class ProcessorArguments:
         default=16000,
         metadata={"help": "The sampling rate of audio inputs."},
     )
+    audio_feature_extractor_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to a standalone audio feature extractor (e.g. whisper-large-v3 dir). "
+            "When the base model's processor has no `feature_extractor` (vision-only VLM like "
+            "Qwen3.5-VL), set this to attach a Whisper feature_extractor so that audio (<|AUDIO|>) "
+            "inputs can be turned into mel-spectrograms. If None, the base processor is used as-is."
+        },
+    )
     trust_remote_code: bool = field(
         default=False,
         metadata={"help": "Trust remote code for Huggingface."},

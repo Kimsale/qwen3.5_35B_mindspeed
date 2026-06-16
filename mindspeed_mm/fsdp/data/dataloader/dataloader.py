@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from mindspeed_mm.fsdp.data.data_utils.utils import get_seed_worker
-from mindspeed_mm.fsdp.data.dataloader.sampler import BaseRandomBatchSampler
+from mindspeed_mm.fsdp.data.dataloader.sampler import BaseRandomBatchSampler, LengthBucketBatchSampler
 from mindspeed_mm.fsdp.data.dataloader.data_collator import DATA_COLLATOR
 from mindspeed_mm.fsdp.utils.constants import GLOBAL_STEP_TOKEN_NUM, AVG_PER_STEP_TOKEN_NUM
 from mindspeed_mm.fsdp.utils.device import get_device_type
@@ -38,12 +38,14 @@ def prepare_sampler_dataloader(
     num_workers=0,
     prefetch_factor=None,
     persistent_workers=None,
+    timeout=0,
     process_group: Optional[ProcessGroup] = None,
     data_sharding=False,
     sampler_type="stateful_distributed_sampler",
     collate_param=None,
     dataset_param=None,
     model=None,
+    length_bucket_size_multiplier=64,
 ):
     """
     Prepare a dataloader for distributed training. The dataloader will be wrapped by
@@ -69,9 +71,16 @@ def prepare_sampler_dataloader(
 
     if persistent_workers is None:
         persistent_workers = True if num_workers > 0 else False
+    timeout = int(timeout or 0)
 
-    if sampler_type == "BaseRandomBatchSampler":
-        batch_sampler = BaseRandomBatchSampler(
+    if sampler_type in ("BaseRandomBatchSampler", "LengthBucketBatchSampler"):
+        sampler_cls = BaseRandomBatchSampler
+        sampler_kwargs = {}
+        if sampler_type == "LengthBucketBatchSampler":
+            sampler_cls = LengthBucketBatchSampler
+            sampler_kwargs["bucket_size_multiplier"] = length_bucket_size_multiplier
+
+        batch_sampler = sampler_cls(
             dataset,
             batch_size=batch_size,
             num_replicas=process_group.size(),
@@ -79,6 +88,7 @@ def prepare_sampler_dataloader(
             shuffle=shuffle,
             drop_last=drop_last,
             data_sharding=data_sharding,
+            **sampler_kwargs,
         )
         if collate_param is None:
             collate_fn = None
@@ -101,7 +111,8 @@ def prepare_sampler_dataloader(
             num_workers=num_workers,
             batch_sampler=batch_sampler,
             prefetch_factor=prefetch_factor,
-            persistent_workers=persistent_workers
+            persistent_workers=persistent_workers,
+            timeout=timeout if num_workers > 0 else 0,
         )
     else:
         raise NotImplementedError(f"Sampler type {sampler_type} is not implemented.")

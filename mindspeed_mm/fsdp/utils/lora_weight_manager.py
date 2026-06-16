@@ -369,10 +369,13 @@ class LoraWeightManager:
         
         for name, param in lora_params:
             param_data = self._gather_dtensor(param.data) if self._is_dtensor(param.data) else param.data
+            # 修复: meta device 上的 tensor 无实际数据，跳过 NaN/Inf 检查
+            if param_data.is_meta:
+                continue
             if param_data.isnan().any():
                 logger.error(f"LoRA parameter {name} contains NaN values")
                 return False
-            
+
             if param_data.isinf().any():
                 logger.error(f"LoRA parameter {name} contains Inf values")
                 return False

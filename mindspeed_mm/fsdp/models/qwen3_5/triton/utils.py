@@ -131,7 +131,9 @@ def get_available_device() -> str:
     try:
         return triton.runtime.driver.active.get_current_target().backend
     except BaseException:
-        _cpu_device_warning()
+        # 修复: 避免对后面定义的 _cpu_device_warning 的向前引用 NameError
+        import warnings
+        warnings.warn('Triton is not supported on current platform, roll back to CPU.', stacklevel=1)
         return 'cpu'
 
 

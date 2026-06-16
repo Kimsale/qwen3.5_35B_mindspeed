@@ -845,4 +845,19 @@ def load_tokenizer(model_args: "ProcessorArguments") -> "TokenizerModule":
     if processor is not None and "Processor" not in processor.__class__.__name__:
         processor = None
 
+    # Attach a standalone audio feature_extractor (e.g. whisper-large-v3) when the base model's
+    # processor is vision-only (no `feature_extractor`). Required for audio (<|AUDIO|>) inputs on
+    # VLMs like Qwen3.5-VL whose AutoProcessor does not ship an audio branch.
+    audio_fe_path = getattr(model_args, "audio_feature_extractor_path", None)
+    if audio_fe_path is not None and processor is not None and getattr(processor, "feature_extractor", None) is None:
+        from transformers import AutoFeatureExtractor
+
+        feature_extractor = AutoFeatureExtractor.from_pretrained(
+            audio_fe_path,
+            local_files_only=True,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+        setattr(processor, "feature_extractor", feature_extractor)
+        logger.info("Attached audio feature_extractor from %s to processor.", audio_fe_path)
+
     return {"tokenizer": tokenizer, "processor": processor}
