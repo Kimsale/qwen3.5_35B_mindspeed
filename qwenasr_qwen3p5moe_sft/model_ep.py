@@ -697,62 +697,81 @@ class EPSpeechTranslationModel(nn.Module):
         inputs_embeds = inputs_embeds.to(dtype=torch.bfloat16)
 
         # 4. LLM forward (with EP MoE blocks)
-        # Note: For now, we don't patch Qwen3 attention to use cu_seqlens directly.
-        # Instead, when in pack format, we generate an attention_mask from cu_seqlens.
-        # This still saves memory (no padding in tokens) and most compute (tighter packing),
-        # but attention still uses regular mask-based FA2 instead of varlen mode.
-        # TODO: Implement varlen attention patch for full optimization.
-
-        if is_packed and attention_mask is None:
-            # Generate causal attention mask for pack format
-            # Shape: (batch_size, 1, max_seq_len, max_seq_len) or simplified (total_len, total_len)
-            # For simplicity, we create a block-diagonal causal mask
-            attention_mask = self._create_packed_attention_mask(cu_seqlens, total_len, device)
+        # Pack format strategy: treat the packed stream as a single batch=1 sequence and
+        # supply a block-diagonal causal mask so samples cannot attend across boundaries.
+        # The HF model derives seq_len from inputs_embeds.shape[1], so packed tensors MUST
+        # carry a leading batch dim: (1, total_len, hidden). position_ids/labels likewise.
+        # Mathematical equivalence to per-sample forward holds because:
+        #   - block-diagonal mask isolates samples (no cross-sample attention)
+        #   - position_ids restart at 0 per sample (set by PackedDataCollator)
+        #   - HF's internal causal-shift loss only contaminates at sample boundaries,
+        #     and those boundary labels are -100 (prompt/audio tokens) -> ignored.
+        if is_packed:
+            # Add leading batch dim for the LLM (batch=1)
+            inputs_embeds = inputs_embeds.unsqueeze(0)                      # (1, total_len, hidden)
+            llm_position_ids = position_ids.unsqueeze(0) if position_ids is not None else None
+            llm_labels = labels.unsqueeze(0) if labels is not None else None
+            if attention_mask is None:
+                attention_mask = self._create_packed_attention_mask(
+                    cu_seqlens, total_len, device, inputs_embeds.dtype
+                )
+        else:
+            llm_position_ids = position_ids
+            llm_labels = labels
 
         outputs = self.llm(
             inputs_embeds=inputs_embeds,
-            position_ids=position_ids,
+            position_ids=llm_position_ids,
             attention_mask=attention_mask,
-            labels=labels,
+            labels=llm_labels,
             return_dict=True,
         )
+
+        # Squeeze the batch dim back out so downstream training code sees (total_len, vocab),
+        # consistent with the packed 1D labels/input_ids it already works with.
+        if is_packed and outputs.logits is not None and outputs.logits.dim() == 3:
+            outputs.logits = outputs.logits.squeeze(0)
+
         return outputs
 
-    def _create_packed_attention_mask(self, cu_seqlens, total_len, device):
+    def _create_packed_attention_mask(self, cu_seqlens, total_len, device, dtype=torch.bfloat16):
         """Create block-diagonal causal attention mask for packed sequences.
 
         Each sample can only attend to tokens within its own sequence (cu_seqlens boundaries),
         and must respect causal masking (can't attend to future tokens).
 
         Returns:
-            attention_mask: (total_len, total_len) or (1, 1, total_len, total_len)
-            where mask[i,j] = 0 means position i can attend to position j
+            attention_mask: (1, 1, total_len, total_len) additive float mask, broadcast over
+            batch and heads. 0.0 = attend, large-negative = masked. This is the format the
+            transformers SDPA/eager attention path consumes when a custom 4D mask is supplied.
         """
         batch_size = len(cu_seqlens) - 1
-        # Create a full mask (total_len, total_len), initially all -inf (cannot attend)
-        mask = torch.full((total_len, total_len), float('-inf'), device=device, dtype=torch.bfloat16)
+        # Most-negative finite value for this dtype (avoid -inf so that fully-masked rows,
+        # if any, don't produce NaN after softmax; matches HF's min_dtype convention).
+        min_val = torch.finfo(dtype).min
 
-        # Fill in each sample's block with causal mask
+        # Start fully masked, then open up each sample's lower-triangular block.
+        mask = torch.full((total_len, total_len), min_val, device=device, dtype=dtype)
+
         for b in range(batch_size):
             start = cu_seqlens[b].item()
-            end = cu_seqlens[b+1].item()
+            end = cu_seqlens[b + 1].item()
             seq_len = end - start
 
-            # Create causal mask for this sample: lower triangular (can attend to past)
-            # torch.tril creates a lower triangular matrix of 1s
-            causal_block = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bfloat16))
-            # Convert 1 -> 0 (can attend), 0 -> -inf (cannot attend)
-            causal_block = (1.0 - causal_block) * float('-inf')
+            # Lower-triangular (incl. diagonal) -> can attend to self + past within sample.
+            causal_block = torch.tril(
+                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool)
+            )
+            # Place 0.0 where attention is allowed, leave min_val elsewhere.
+            block = torch.where(
+                causal_block,
+                torch.zeros((), device=device, dtype=dtype),
+                torch.full((), min_val, device=device, dtype=dtype),
+            )
+            mask[start:end, start:end] = block
 
-            # Place into the full mask at positions [start:end, start:end]
-            mask[start:end, start:end] = causal_block
-
-        # Transformers expects 4D mask: (batch_size, 1, seq_len, seq_len)
-        # But with packed format, we have (total_len,) not (batch_size, seq_len)
-        # So we use (1, 1, total_len, total_len) as a broadcast-compatible shape
-        mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, total_len, total_len)
-
-        return mask
+        # (1, 1, total_len, total_len): broadcast over batch dim and head dim.
+        return mask.unsqueeze(0).unsqueeze(0)
 
     def _replace_audio_tokens_packed(self, inputs_embeds, audio_embeds, input_ids, cu_seqlens):
         """Replace audio tokens in pack format (按cu_seqlens边界逐样本替换)."""
