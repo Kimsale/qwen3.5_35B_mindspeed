@@ -1,0 +1,2073 @@
+diff --git a/mindspeed_mm/fsdp/data/data_utils/func_utils/convert.py b/mindspeed_mm/fsdp/data/data_utils/func_utils/convert.py
+index 769ce576..ee2716f4 100644
+--- a/mindspeed_mm/fsdp/data/data_utils/func_utils/convert.py
++++ b/mindspeed_mm/fsdp/data/data_utils/func_utils/convert.py
+@@ -845,4 +845,19 @@ def load_tokenizer(model_args: "ProcessorArguments") -> "TokenizerModule":
+     if processor is not None and "Processor" not in processor.__class__.__name__:
+         processor = None
+ 
++    # Attach a standalone audio feature_extractor (e.g. whisper-large-v3) when the base model's
++    # processor is vision-only (no `feature_extractor`). Required for audio (<|AUDIO|>) inputs on
++    # VLMs like Qwen3.5-VL whose AutoProcessor does not ship an audio branch.
++    audio_fe_path = getattr(model_args, "audio_feature_extractor_path", None)
++    if audio_fe_path is not None and processor is not None and getattr(processor, "feature_extractor", None) is None:
++        from transformers import AutoFeatureExtractor
++
++        feature_extractor = AutoFeatureExtractor.from_pretrained(
++            audio_fe_path,
++            local_files_only=True,
++            trust_remote_code=model_args.trust_remote_code,
++        )
++        setattr(processor, "feature_extractor", feature_extractor)
++        logger.info("Attached audio feature_extractor from %s to processor.", audio_fe_path)
++
+     return {"tokenizer": tokenizer, "processor": processor}
+\ No newline at end of file
+diff --git a/mindspeed_mm/fsdp/data/data_utils/func_utils/model_args.py b/mindspeed_mm/fsdp/data/data_utils/func_utils/model_args.py
+index ed9fe95c..d58328ca 100644
+--- a/mindspeed_mm/fsdp/data/data_utils/func_utils/model_args.py
++++ b/mindspeed_mm/fsdp/data/data_utils/func_utils/model_args.py
+@@ -86,6 +86,15 @@ class ProcessorArguments:
+         default=16000,
+         metadata={"help": "The sampling rate of audio inputs."},
+     )
++    audio_feature_extractor_path: Optional[str] = field(
++        default=None,
++        metadata={
++            "help": "Path to a standalone audio feature extractor (e.g. whisper-large-v3 dir). "
++            "When the base model's processor has no `feature_extractor` (vision-only VLM like "
++            "Qwen3.5-VL), set this to attach a Whisper feature_extractor so that audio (<|AUDIO|>) "
++            "inputs can be turned into mel-spectrograms. If None, the base processor is used as-is."
++        },
++    )
+     trust_remote_code: bool = field(
+         default=False,
+         metadata={"help": "Trust remote code for Huggingface."},
+diff --git a/mindspeed_mm/fsdp/data/dataloader/dataloader.py b/mindspeed_mm/fsdp/data/dataloader/dataloader.py
+index 120ebce0..1c895fdf 100644
+--- a/mindspeed_mm/fsdp/data/dataloader/dataloader.py
++++ b/mindspeed_mm/fsdp/data/dataloader/dataloader.py
+@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
+ from torchdata.stateful_dataloader import StatefulDataLoader
+ 
+ from mindspeed_mm.fsdp.data.data_utils.utils import get_seed_worker
+-from mindspeed_mm.fsdp.data.dataloader.sampler import BaseRandomBatchSampler
++from mindspeed_mm.fsdp.data.dataloader.sampler import BaseRandomBatchSampler, LengthBucketBatchSampler
+ from mindspeed_mm.fsdp.data.dataloader.data_collator import DATA_COLLATOR
+ from mindspeed_mm.fsdp.utils.constants import GLOBAL_STEP_TOKEN_NUM, AVG_PER_STEP_TOKEN_NUM
+ from mindspeed_mm.fsdp.utils.device import get_device_type
+@@ -38,12 +38,14 @@ def prepare_sampler_dataloader(
+     num_workers=0,
+     prefetch_factor=None,
+     persistent_workers=None,
++    timeout=0,
+     process_group: Optional[ProcessGroup] = None,
+     data_sharding=False,
+     sampler_type="stateful_distributed_sampler",
+     collate_param=None,
+     dataset_param=None,
+     model=None,
++    length_bucket_size_multiplier=64,
+ ):
+     """
+     Prepare a dataloader for distributed training. The dataloader will be wrapped by
+@@ -69,9 +71,16 @@ def prepare_sampler_dataloader(
+ 
+     if persistent_workers is None:
+         persistent_workers = True if num_workers > 0 else False
++    timeout = int(timeout or 0)
+ 
+-    if sampler_type == "BaseRandomBatchSampler":
+-        batch_sampler = BaseRandomBatchSampler(
++    if sampler_type in ("BaseRandomBatchSampler", "LengthBucketBatchSampler"):
++        sampler_cls = BaseRandomBatchSampler
++        sampler_kwargs = {}
++        if sampler_type == "LengthBucketBatchSampler":
++            sampler_cls = LengthBucketBatchSampler
++            sampler_kwargs["bucket_size_multiplier"] = length_bucket_size_multiplier
++
++        batch_sampler = sampler_cls(
+             dataset,
+             batch_size=batch_size,
+             num_replicas=process_group.size(),
+@@ -79,6 +88,7 @@ def prepare_sampler_dataloader(
+             shuffle=shuffle,
+             drop_last=drop_last,
+             data_sharding=data_sharding,
++            **sampler_kwargs,
+         )
+         if collate_param is None:
+             collate_fn = None
+@@ -101,7 +111,8 @@ def prepare_sampler_dataloader(
+             num_workers=num_workers,
+             batch_sampler=batch_sampler,
+             prefetch_factor=prefetch_factor,
+-            persistent_workers=persistent_workers
++            persistent_workers=persistent_workers,
++            timeout=timeout if num_workers > 0 else 0,
+         )
+     else:
+         raise NotImplementedError(f"Sampler type {sampler_type} is not implemented.")
+@@ -184,4 +195,4 @@ class PrefetchGradAccDataLoader:
+         return self.base_dataloader.state_dict()
+ 
+     def load_state_dict(self, **kwargs):
+-        self.base_dataloader.load_state_dict(**kwargs)
+\ No newline at end of file
++        self.base_dataloader.load_state_dict(**kwargs)
+diff --git a/mindspeed_mm/fsdp/data/dataloader/sampler.py b/mindspeed_mm/fsdp/data/dataloader/sampler.py
+index 7326e74d..0090abc7 100644
+--- a/mindspeed_mm/fsdp/data/dataloader/sampler.py
++++ b/mindspeed_mm/fsdp/data/dataloader/sampler.py
+@@ -1,4 +1,6 @@
+ from typing import Optional, Dict, Any
++import wave
++
+ import torch
+ import torch.distributed as dist
+ from torch.utils.data.distributed import DistributedSampler
+@@ -107,4 +109,99 @@ class BaseRandomBatchSampler(StatefulDistributedSampler):
+             raise ValueError("Invalid state_dict")
+         if state_dict[self._YIELDED] < 0:
+             raise ValueError("Cannot load state_dict with negative yielded value")
+-        self.next_consumed_samples = state_dict[self._YIELDED]
+\ No newline at end of file
++        self.next_consumed_samples = state_dict[self._YIELDED]
++
++
++class LengthBucketBatchSampler(BaseRandomBatchSampler):
++    """
++    Batch sampler that keeps distributed global micro-batches close in text/audio
++    length. This reduces dynamic-shape churn for multimodal SFT while preserving
++    the same samples, model, and global batch semantics.
++    """
++
++    def __init__(
++        self,
++        dataset,
++        batch_size: int = 1,
++        num_replicas: Optional[int] = None,
++        rank: Optional[int] = None,
++        shuffle: bool = True,
++        seed: int = 0,
++        drop_last: bool = True,
++        data_sharding: bool = False,
++        bucket_size_multiplier: int = 64,
++    ):
++        super().__init__(
++            dataset=dataset,
++            batch_size=batch_size,
++            num_replicas=num_replicas,
++            rank=rank,
++            shuffle=shuffle,
++            seed=seed,
++            drop_last=drop_last,
++            data_sharding=data_sharding,
++        )
++        if data_sharding:
++            raise ValueError("LengthBucketBatchSampler does not support data_sharding=True.")
++        self.bucket_size_multiplier = max(1, int(bucket_size_multiplier))
++        self.lengths = [self._sample_length(idx) for idx in range(self.total_samples)]
++
++    def _sample_length(self, idx: int) -> int:
++        item = self.dataset[idx]
++        length = len(item.get("input_ids", []) or [])
++        for audio_path in item.get("audios", []) or []:
++            try:
++                with wave.open(audio_path, "rb") as audio_file:
++                    length += audio_file.getnframes() // 320
++            except (FileNotFoundError, wave.Error, EOFError, TypeError):
++                continue
++        return length
++
++    def _epoch_global_batches(self, active_total_samples: int):
++        global_batch_size = self.micro_batch_times_data_parallel_size
++        indices = list(range(active_total_samples))
++        generator = torch.Generator()
++        generator.manual_seed(self.seed + self.epoch)
++
++        if not self.shuffle:
++            indices.sort(key=lambda idx: self.lengths[idx])
++            return [
++                indices[start:start + global_batch_size]
++                for start in range(0, len(indices), global_batch_size)
++            ]
++
++        shuffled = torch.randperm(len(indices), generator=generator).tolist()
++        indices = [indices[idx] for idx in shuffled]
++        bucket_size = global_batch_size * self.bucket_size_multiplier
++        batches = []
++        for start in range(0, len(indices), bucket_size):
++            bucket = indices[start:start + bucket_size]
++            bucket.sort(key=lambda idx: self.lengths[idx])
++            bucket = bucket[:len(bucket) - (len(bucket) % global_batch_size)]
++            for batch_start in range(0, len(bucket), global_batch_size):
++                batches.append(bucket[batch_start:batch_start + global_batch_size])
++
++        if not batches:
++            return []
++        order = torch.randperm(len(batches), generator=generator).tolist()
++        return [batches[idx] for idx in order]
++
++    def __iter__(self):
++        if self.next_consumed_samples is not None:
++            self.consumed_samples = self.next_consumed_samples
++            self.next_consumed_samples = None
++
++        active_total_samples = self.total_samples - self.last_batch_size
++        self.epoch = self.consumed_samples // active_total_samples
++        current_epoch_samples = self.consumed_samples % active_total_samples
++        batch_offset = current_epoch_samples // self.micro_batch_times_data_parallel_size
++
++        global_batches = self._epoch_global_batches(active_total_samples)
++        rank_start = self.rank * self.micro_batch_size
++        rank_end = rank_start + self.micro_batch_size
++        for global_batch in global_batches[batch_offset:]:
++            batch = global_batch[rank_start:rank_end]
++            if len(batch) != self.micro_batch_size:
++                continue
++            self.consumed_samples += self.micro_batch_times_data_parallel_size
++            yield batch
+diff --git a/mindspeed_mm/fsdp/distributed/expert_parallel/ep_dispatcher.py b/mindspeed_mm/fsdp/distributed/expert_parallel/ep_dispatcher.py
+index 146155cb..5cce203d 100644
+--- a/mindspeed_mm/fsdp/distributed/expert_parallel/ep_dispatcher.py
++++ b/mindspeed_mm/fsdp/distributed/expert_parallel/ep_dispatcher.py
+@@ -1,3 +1,6 @@
++import os
++import time
++from collections import defaultdict
+ from typing import List, Optional
+ 
+ import torch
+@@ -10,6 +13,150 @@ from mindspeed_mm.fsdp.ops.moe_ops.unpermute import unpermute
+ from mindspeed_mm.fsdp.ops.swiglu import swiglu
+ 
+ 
++_MOE_PHASE_STATE = {
++    "calls": 0,
++    "window_calls": 0,
++    "lines": 0,
++    "phase_ms": defaultdict(float),
++    "scalar": defaultdict(float),
++    "last_input_splits": None,
++    "last_output_splits": None,
++}
++
++
++def _env_bool(name: str, default: bool = False) -> bool:
++    value = os.getenv(name)
++    if value is None:
++        return default
++    return value.lower() in ("1", "true", "yes", "on")
++
++
++def _env_int(name: str, default: int) -> int:
++    try:
++        return int(os.getenv(name, str(default)))
++    except ValueError:
++        return default
++
++
++def _phase_sync(enabled: bool):
++    if enabled and hasattr(torch, "npu") and torch.npu.is_available():
++        torch.npu.synchronize()
++
++
++def _format_int_list(values: List[int]) -> str:
++    return "[" + ",".join(str(value) for value in values) + "]"
++
++
++def _profile_rank_enabled() -> bool:
++    ranks = os.getenv("MOE_PHASE_RANKS", "0")
++    if not dist.is_available() or not dist.is_initialized():
++        rank = 0
++    else:
++        rank = dist.get_rank()
++    return str(rank) in {item.strip() for item in ranks.split(",") if item.strip()}
++
++
++class _MoePhaseProfiler:
++    def __init__(self, fused: bool):
++        self.enabled = _env_bool("MOE_PHASE_TIMING", False) and _profile_rank_enabled()
++        self.sync = _env_bool("MOE_PHASE_TIMING_SYNC", False)
++        self.fused = fused
++        self.phase_ms = {}
++        self._last = None
++        if self.enabled:
++            _phase_sync(self.sync)
++            self._last = time.perf_counter()
++
++    def mark(self, name: str):
++        if not self.enabled:
++            return
++        _phase_sync(self.sync)
++        now = time.perf_counter()
++        self.phase_ms[name] = self.phase_ms.get(name, 0.0) + (now - self._last) * 1000.0
++        self._last = now
++
++    def finish(
++        self,
++        input_splits: List,
++        output_splits: List,
++        num_global_sum_tokens_per_local_expert: torch.Tensor,
++    ):
++        if not self.enabled:
++            return
++
++        state = _MOE_PHASE_STATE
++        state["calls"] += 1
++        start_call = _env_int("MOE_PHASE_START_CALL", 0)
++        if state["calls"] <= start_call:
++            return
++
++        state["window_calls"] += 1
++        for name, value in self.phase_ms.items():
++            state["phase_ms"][name] += value
++
++        counts = num_global_sum_tokens_per_local_expert.detach().float()
++        if counts.numel() > 0:
++            state["scalar"]["expert_counts_mean"] += counts.mean().item()
++            state["scalar"]["expert_counts_max"] += counts.max().item()
++            state["scalar"]["expert_counts_std"] += counts.std(unbiased=False).item()
++            nonzero = torch.count_nonzero(counts).item()
++            state["scalar"]["expert_counts_nonzero"] += float(nonzero)
++
++        state["last_input_splits"] = [int(x) for x in input_splits]
++        state["last_output_splits"] = [int(x) for x in output_splits]
++
++        log_every = max(1, _env_int("MOE_PHASE_LOG_EVERY", 80))
++        max_lines = _env_int("MOE_PHASE_MAX_LINES", 40)
++        if state["window_calls"] < log_every:
++            return
++        if max_lines >= 0 and state["lines"] >= max_lines:
++            state["phase_ms"].clear()
++            state["scalar"].clear()
++            state["window_calls"] = 0
++            return
++
++        calls = state["window_calls"]
++        phase_parts = [
++            f"{name}_ms={state['phase_ms'][name] / calls:.3f}"
++            for name in (
++                "dispatch_preprocess",
++                "permute_pre_a2a",
++                "alltoall_dispatch",
++                "permute_post_a2a",
++                "gmm_fc1",
++                "swiglu",
++                "gmm_fc2",
++                "unpermute_pre_combine",
++                "alltoall_combine",
++                "unpermute_final",
++            )
++            if name in state["phase_ms"]
++        ]
++        scalar_parts = [
++            f"{name}={state['scalar'][name] / calls:.3f}"
++            for name in (
++                "expert_counts_mean",
++                "expert_counts_max",
++                "expert_counts_std",
++                "expert_counts_nonzero",
++            )
++            if name in state["scalar"]
++        ]
++        print(
++            "[moe_phase] "
++            f"rank={dist.get_rank() if dist.is_available() and dist.is_initialized() else 0} "
++            f"call={state['calls']} window_calls={calls} fused={int(self.fused)} "
++            + " ".join(phase_parts + scalar_parts)
++            + f" input_splits={_format_int_list(state['last_input_splits'])} "
++            + f"output_splits={_format_int_list(state['last_output_splits'])}",
++            flush=True,
++        )
++        state["lines"] += 1
++        state["phase_ms"].clear()
++        state["scalar"].clear()
++        state["window_calls"] = 0
++
++
+ def all_to_all(
+     input_: torch.Tensor,
+     process_group: dist.ProcessGroup,
+@@ -34,10 +181,12 @@ def ep_forward(
+     if routing_weights.size() != selected_experts.size():
+         routing_weights = routing_weights.gather(1, selected_experts)
+ 
++    profiler = _MoePhaseProfiler(fused=fused)
+     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+     input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
+         dispatch_preprocess(selected_experts, num_experts, ep_group)
+     )
++    profiler.mark("dispatch_preprocess")
+     hidden_states, unpermute_indices, post_dispatch_unpermute_indices = alltoall_dispatch(
+         hidden_states,
+         selected_experts,
+@@ -47,20 +196,27 @@ def ep_forward(
+         num_global_tokens_per_local_expert,
+         ep_group,
+         fused=fused,
++        profiler=profiler,
+     )
+ 
+     # If no tokens are assigned to the expert in the current EP shard, no computation is performed
+     if hidden_states.shape[0] > 0:
+         intermediate_hidden_states = grouped_matmul(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert, fused=fused)
++        profiler.mark("gmm_fc1")
+         intermediate_activations = swiglu(intermediate_hidden_states, dim=-1, fused=fused)
++        profiler.mark("swiglu")
+         hidden_states = grouped_matmul(
+             intermediate_activations, fc2_weight, num_global_sum_tokens_per_local_expert, fused=fused
+         )
++        profiler.mark("gmm_fc2")
+     else:
+         # empty operation to avoid no grads for experts' weights
+         intermediate_hidden_states = hidden_states @ fc1_weight.sum(0)
+         gate_output, down_output = torch.chunk(intermediate_hidden_states, 2, dim=-1)
+         hidden_states = (gate_output + down_output) @ fc2_weight.sum(0) * 0.
++        profiler.mark("gmm_fc1")
++        profiler.mark("swiglu")
++        profiler.mark("gmm_fc2")
+ 
+     hidden_states = alltoall_combine(
+         hidden_states,
+@@ -72,7 +228,9 @@ def ep_forward(
+         num_experts,
+         num_global_tokens_per_local_expert,
+         ep_group,
++        profiler=profiler,
+     )
++    profiler.finish(input_splits, output_splits, num_global_sum_tokens_per_local_expert)
+     return hidden_states
+ 
+ 
+@@ -125,9 +283,14 @@ def alltoall_dispatch(
+     num_global_tokens_per_local_expert: torch.Tensor,
+     ep_group: Optional[dist.ProcessGroup] = None,
+     fused: bool = True,
++    profiler: Optional[_MoePhaseProfiler] = None,
+ ):
+     hidden_states, unpermute_indices = permute(hidden_states, selected_experts.to(torch.int32), fused=fused)
++    if profiler is not None:
++        profiler.mark("permute_pre_a2a")
+     hidden_states = all_to_all(hidden_states, ep_group, scatter_sizes=input_splits, gather_sizes=output_splits)
++    if profiler is not None:
++        profiler.mark("alltoall_dispatch")
+ 
+     # No tokens have been assigned to the expert in the current EP shard
+     if hidden_states.shape[0] == 0:
+@@ -143,6 +306,8 @@ def alltoall_dispatch(
+     _expert_ids_per_ep_rank = torch.arange(num_global_experts, dtype=torch.int32, device=hidden_states.device) % num_local_experts
+     global_input_tokens_local_experts_indices = torch.repeat_interleave(_expert_ids_per_ep_rank, num_global_tokens_per_local_expert.ravel())
+     hidden_states, post_dispatch_unpermute_indices = permute(hidden_states, global_input_tokens_local_experts_indices, fused=fused)
++    if profiler is not None:
++        profiler.mark("permute_post_a2a")
+ 
+     return hidden_states, unpermute_indices, post_dispatch_unpermute_indices
+ 
+@@ -158,6 +323,7 @@ def alltoall_combine(
+     num_global_tokens_per_local_expert: torch.Tensor,
+     ep_group: Optional[dist.ProcessGroup] = None,
+     fused: bool = True,
++    profiler: Optional[_MoePhaseProfiler] = None,
+ ):
+     # If no tokens are assigned to the expert in the current EP shard, no computation is performed
+     if hidden_states.shape[0] > 0:
+@@ -168,8 +334,14 @@ def alltoall_combine(
+         )
+ 
+         hidden_states = unpermute(hidden_states, post_dispatch_unpermute_indices, fused=fused)
++    if profiler is not None:
++        profiler.mark("unpermute_pre_combine")
+ 
+     hidden_states = all_to_all(hidden_states, ep_group, scatter_sizes=output_splits, gather_sizes=input_splits)
++    if profiler is not None:
++        profiler.mark("alltoall_combine")
+     hidden_states = unpermute(hidden_states.to(routing_weights.dtype), unpermute_indices,
+                                                       probs=routing_weights, fused=fused)
++    if profiler is not None:
++        profiler.mark("unpermute_final")
+     return hidden_states
+diff --git a/mindspeed_mm/fsdp/distributed/expert_parallel/expert_parallel.py b/mindspeed_mm/fsdp/distributed/expert_parallel/expert_parallel.py
+index f1eff638..cef4863d 100644
+--- a/mindspeed_mm/fsdp/distributed/expert_parallel/expert_parallel.py
++++ b/mindspeed_mm/fsdp/distributed/expert_parallel/expert_parallel.py
+@@ -30,7 +30,13 @@ def expert_parallelize_modules(modules: torch.nn.Module, ep_mesh: DeviceMesh, pl
+ 
+         # replace forward with ep forward
+         if hasattr(module, 'ep_forward') and callable(module.ep_forward):
+-            module.forward = partial(module.ep_forward, ep_group=ep_group)
++            # Forward the configured dispatcher (eager/fused/mc2) so the module's
++            # ep_forward can opt into mc2 comm-compute overlap. Defaults preserve
++            # the previous fused behaviour for modules that ignore the kwarg.
++            try:
++                module.forward = partial(module.ep_forward, ep_group=ep_group, dispatcher=plan.dispatcher)
++            except TypeError:
++                module.forward = partial(module.ep_forward, ep_group=ep_group)
+         else:
+             experts_forward_fn = get_experts_forward_fn_for_qwen(ep_group, dispatcher=plan.dispatcher)
+             module.forward = types.MethodType(experts_forward_fn, module)
+diff --git a/mindspeed_mm/fsdp/models/qwen3_5/triton/utils.py b/mindspeed_mm/fsdp/models/qwen3_5/triton/utils.py
+index 9ec50044..d856bc97 100644
+--- a/mindspeed_mm/fsdp/models/qwen3_5/triton/utils.py
++++ b/mindspeed_mm/fsdp/models/qwen3_5/triton/utils.py
+@@ -131,7 +131,9 @@ def get_available_device() -> str:
+     try:
+         return triton.runtime.driver.active.get_current_target().backend
+     except BaseException:
+-        _cpu_device_warning()
++        # 修复: 避免对后面定义的 _cpu_device_warning 的向前引用 NameError
++        import warnings
++        warnings.warn('Triton is not supported on current platform, roll back to CPU.', stacklevel=1)
+         return 'cpu'
+ 
+ 
+diff --git a/mindspeed_mm/fsdp/models/qwen3_5_audio/__init__.py b/mindspeed_mm/fsdp/models/qwen3_5_audio/__init__.py
+new file mode 100644
+index 00000000..10ea69e8
+--- /dev/null
++++ b/mindspeed_mm/fsdp/models/qwen3_5_audio/__init__.py
+@@ -0,0 +1,27 @@
++# Copyright 2025 Huawei Technologies Co., Ltd. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Qwen3.5-Audio plugin：import 即触发 ``@model_register.register("qwen3_5_audio")``。
++
++在 YAML 的 ``training.plugin`` 列表里加入本目录路径即可被框架动态加载：
++
++    training:
++      plugin:
++        - mindspeed_mm/fsdp/models/qwen3_5_audio
++        - mindspeed_mm/fsdp/data/datasets/huggingface
++"""
++
++from .modeling_qwen3_5_audio import Qwen3_5AudioForConditionalGeneration
++
++__all__ = ["Qwen3_5AudioForConditionalGeneration"]
+diff --git a/mindspeed_mm/fsdp/models/qwen3_5_audio/convert_weights.py b/mindspeed_mm/fsdp/models/qwen3_5_audio/convert_weights.py
+new file mode 100644
+index 00000000..16daab6b
+--- /dev/null
++++ b/mindspeed_mm/fsdp/models/qwen3_5_audio/convert_weights.py
+@@ -0,0 +1,141 @@
++# Copyright 2025 Huawei Technologies Co., Ltd. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""把 Qwen3.5-MoE 基座 + Whisper-large-v3 encoder + 初始化的 projector
++合并成一个 DCP 权重，供 FSDP2 栈的 meta-device 初始化 + DCP 加载使用。
++
++为什么需要这一步
++----------------
++FSDP2 训练入口用 ``init_model_with_meta_device=True`` 构建模型（空壳），随后用
++``training.load`` 指定的 DCP 权重去填充。DCP 加载是 ``allow_partial_load`` 模式：
++checkpoint 里缺失的参数 **不会报错**，但会保持 ``to_empty`` 后的未初始化显存
++（垃圾值）。因此若不把 audio_tower / audio_projector 的权重写进 DCP，Whisper
++就会是垃圾权重 —— 训练在数学上无意义。
++
++本脚本产出的 DCP 同时包含三部分，key 前缀与模型 ``named_parameters`` 完全对应：
++  * ``model.*``            —— Qwen3.5-MoE 基座（含 MoE expert 的 reshape/permute）
++  * ``audio_tower.encoder.*`` —— Whisper-large-v3 的 encoder 权重
++  * ``audio_projector.*``  —— 新增 projector，按指定 init 方式初始化（默认 kaiming）
++
++用法
++----
++    bash 进入 CANN8.5 环境后执行：
++    python -m mindspeed_mm.fsdp.models.qwen3_5_audio.convert_weights \
++        --qwen_hf_dir   /mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B \
++        --whisper_hf_dir /mnt/shared_data_196/sejin/models/whisper-large-v3 \
++        --dcp_dir       /mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B-audio-dcp \
++        --llm_hidden_size 2048
++"""
++
++import argparse
++import re
++from pathlib import Path
++
++import torch
++from torch import nn
++from safetensors.torch import load_file
++from transformers.models.whisper.configuration_whisper import WhisperConfig
++
++from checkpoint.common.hf_to_dcp import hf_to_dcp_sharded
++from .projector import AudioProjector
++
++
++# 与 Qwen35Converter 一致：MoE expert 权重需要 reshape + permute 以适配 gemm。
++EXPERT_PATTERNS = [
++    r"model\.language_model\.layers\.\d+\.mlp\.experts\.gate_up_proj",
++    r"model\.language_model\.layers\.\d+\.mlp\.experts\.down_proj",
++]
++TIE_MAPPING = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
++
++
++def _convert_qwen_shard(state_dict):
++    """对单个 Qwen safetensors 分片做 tie / reshape / permute（沿用官方 Qwen35Converter 逻辑）。"""
++    for tgt, src in TIE_MAPPING.items():
++        if src in state_dict:
++            state_dict[tgt] = state_dict[src]
++
++    for key in list(state_dict.keys()):
++        value = state_dict.pop(key)
++        for pattern in EXPERT_PATTERNS:
++            if re.fullmatch(pattern, key):
++                # (E, 2I, H) -> (E, H, 2I)
++                value = value.permute(0, 2, 1).contiguous()
++        state_dict[key] = value
++    return state_dict
++
++
++def build_audio_state_dict(whisper_hf_dir: str, llm_hidden_size: int, init_lora_weights: str = "kaiming"):
++    """构建 audio_tower.encoder.* 和 audio_projector.* 的 state_dict。"""
++    whisper_config = WhisperConfig.from_pretrained(whisper_hf_dir)
++
++    # ---- whisper encoder 权重 ----
++    enc_sd = {}
++    for f in sorted(Path(whisper_hf_dir).glob("*.safetensors")):
++        sd = load_file(str(f), device="cpu")
++        for k, v in sd.items():
++            # whisper 完整权重里 encoder 子模块前缀为 "model.encoder." 或 "encoder."
++            if k.startswith("model.encoder."):
++                enc_sd["audio_tower.encoder." + k[len("model.encoder."):]] = v
++            elif k.startswith("encoder."):
++                enc_sd["audio_tower.encoder." + k[len("encoder."):]] = v
++    if not enc_sd:
++        raise RuntimeError(f"未在 {whisper_hf_dir} 找到 encoder 权重，请确认 whisper-large-v3 safetensors 完整。")
++
++    # ---- projector 权重（新增模块，初始化后写入）----
++    projector = AudioProjector(
++        audio_hidden_size=whisper_config.d_model,
++        llm_hidden_size=llm_hidden_size,
++    )
++    # LayerNorm/Linear 默认初始化即可；保持 fp32。
++    proj_sd = {f"audio_projector.{k}": v for k, v in projector.state_dict().items()}
++
++    merged = {}
++    merged.update(enc_sd)
++    merged.update(proj_sd)
++    return merged
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--qwen_hf_dir", required=True)
++    parser.add_argument("--whisper_hf_dir", required=True)
++    parser.add_argument("--dcp_dir", required=True)
++    parser.add_argument("--llm_hidden_size", type=int, default=2048)
++    args = parser.parse_args()
++
++    audio_sd = build_audio_state_dict(args.whisper_hf_dir, args.llm_hidden_size)
++    print(f"[convert] audio 权重张量数: {len(audio_sd)}")
++
++    # 标记：第一个分片附加 audio 权重；其余分片只过 qwen 转换。
++    state = {"_audio_injected": False}
++
++    def convert_func(shard_sd):
++        shard_sd = _convert_qwen_shard(shard_sd)
++        if not state["_audio_injected"]:
++            shard_sd.update(audio_sd)
++            state["_audio_injected"] = True
++        return shard_sd
++
++    hf_to_dcp_sharded(
++        hf_dir=args.qwen_hf_dir,
++        dcp_dir=args.dcp_dir,
++        state_dict_convert_func=convert_func,
++    )
++    if not state["_audio_injected"]:
++        raise RuntimeError("audio 权重未被注入，qwen_hf_dir 下没有 safetensors 分片？")
++    print(f"[convert] 完成，DCP 已写入 {args.dcp_dir}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/mindspeed_mm/fsdp/models/qwen3_5_audio/manual_ep.py b/mindspeed_mm/fsdp/models/qwen3_5_audio/manual_ep.py
+new file mode 100644
+index 00000000..c5198672
+--- /dev/null
++++ b/mindspeed_mm/fsdp/models/qwen3_5_audio/manual_ep.py
+@@ -0,0 +1,304 @@
++# Copyright 2025 Huawei Technologies Co., Ltd. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++
++"""Manual EP loader for Qwen3.5 audio training.
++
++This path keeps MindSpeed-MM's existing FSDP2/EP forward path, but bypasses
++DCP loading for the Qwen MoE experts. Expert tensors are read from HF
++safetensors one tensor at a time and sliced on dim=0 before being copied to
++the already-sharded DTensor local storage.
++"""
++
++from __future__ import annotations
++
++import gc
++import json
++import logging
++import os
++import re
++from collections import defaultdict
++from pathlib import Path
++from typing import Dict, Iterable, Optional
++
++import torch
++import torch.distributed as dist
++from safetensors import safe_open
++from safetensors.torch import load_file
++from torch import nn
++from torch.distributed.tensor import DTensor
++from transformers.models.whisper.configuration_whisper import WhisperConfig
++
++from mindspeed.fsdp.utils.log import print_rank
++from mindspeed_mm.fsdp.utils.register import model_register
++
++# The local register decorator does not return the decorated class. Import the
++# module for registration side effects, then fetch the real class from registry.
++from . import modeling_qwen3_5_audio  # noqa: F401
++from .projector import AudioProjector
++
++logger = logging.getLogger(__name__)
++Qwen3_5AudioForConditionalGeneration = model_register.get("qwen3_5_audio")
++
++_EXPERT_RE = re.compile(
++    r"^model\.language_model\.layers\.\d+\.mlp\.experts\."
++    r"(gate_up_proj|down_proj)$"
++)
++_VISUAL_PREFIX = "model.visual."
++_MTP_PREFIX = "mtp."
++_TIE_MAPPING = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
++
++
++def _get_cfg_value(cfg, name: str, default=None):
++    if cfg is None:
++        return default
++    return getattr(cfg, name, default)
++
++
++def _rank() -> int:
++    return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
++
++
++def _world_size() -> int:
++    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
++
++
++def _is_expert_key(key: str) -> bool:
++    return _EXPERT_RE.match(key) is not None
++
++
++def _target_param_names(hf_key: str) -> Iterable[str]:
++    """Yield possible in-model parameter names for a HF safetensors key."""
++    yield hf_key
++    if hf_key.endswith(".weight"):
++        yield hf_key[:-len(".weight")] + ".base_layer.weight"
++    if hf_key.endswith(".bias"):
++        yield hf_key[:-len(".bias")] + ".base_layer.bias"
++
++
++def _find_param(param_by_name: Dict[str, nn.Parameter], hf_key: str) -> Optional[nn.Parameter]:
++    for name in _target_param_names(hf_key):
++        param = param_by_name.get(name)
++        if param is not None:
++            return param
++    return None
++
++
++def _dtensor_local_slice(full_tensor: torch.Tensor, dtensor: DTensor) -> torch.Tensor:
++    """Return the local shard from a full tensor for the DTensor placement."""
++    shard = full_tensor
++    mesh = dtensor.device_mesh
++    coord = mesh.get_coordinate()
++    if coord is None:
++        coord = [0] * mesh.ndim
++
++    for mesh_dim, placement in enumerate(dtensor.placements):
++        if not placement.is_shard():
++            continue
++        shard_dim = placement.dim
++        mesh_size = int(mesh.mesh.shape[mesh_dim])
++        mesh_rank = int(coord[mesh_dim])
++        shard_size, shard_offset = placement._local_shard_size_on_dim(
++            full_tensor.shape[shard_dim],
++            mesh_size,
++            mesh_rank,
++            return_offset=True,
++        )
++        shard = shard.narrow(shard_dim, shard_offset, shard_size)
++
++    local_shape = tuple(dtensor.to_local().shape)
++    if tuple(shard.shape) == local_shape:
++        return shard.contiguous()
++
++    padded = torch.zeros(local_shape, dtype=shard.dtype)
++    common = tuple(slice(0, min(a, b)) for a, b in zip(local_shape, shard.shape))
++    padded[common].copy_(shard[common])
++    return padded
++
++
++def _copy_tensor_to_param(param: nn.Parameter, tensor: torch.Tensor, *, local_tensor: bool = False) -> None:
++    """Copy a CPU tensor into a Tensor or DTensor parameter."""
++    with torch.no_grad():
++        data = param.data
++        if isinstance(data, DTensor):
++            dst = data.to_local()
++            src = tensor.contiguous() if local_tensor else _dtensor_local_slice(tensor, data)
++            if tuple(src.shape) != tuple(dst.shape):
++                raise ValueError(
++                    f"DTensor local shape mismatch: source {tuple(src.shape)} vs target {tuple(dst.shape)}"
++                )
++            dst.copy_(src.to(device=dst.device, dtype=dst.dtype, non_blocking=True))
++        else:
++            if tuple(tensor.shape) != tuple(data.shape):
++                raise ValueError(
++                    f"Tensor shape mismatch: source {tuple(tensor.shape)} vs target {tuple(data.shape)}"
++                )
++            data.copy_(tensor.to(device=data.device, dtype=data.dtype, non_blocking=True))
++
++
++def _prepare_expert_tensor(hf_key: str, tensor: torch.Tensor, start: int, end: int) -> torch.Tensor:
++    local = tensor[start:end].contiguous().clone()
++    # HF stores Qwen3.5 experts as (E, 2I, H) / (E, H, I). MindSpeed grouped
++    # matmul expects (E, H, 2I) / (E, I, H).
++    if hf_key.endswith("gate_up_proj") or hf_key.endswith("down_proj"):
++        local = local.permute(0, 2, 1).contiguous()
++    return local
++
++
++@model_register.register("qwen3_5_audio_manual_ep")
++class Qwen3_5AudioManualEPForConditionalGeneration(Qwen3_5AudioForConditionalGeneration):
++    """Qwen3.5 audio model with safe_open + dim0 expert slicing loader."""
++
++    def load_manual_ep_weights(self, args) -> None:
++        cfg = getattr(args.training, "manual_ep_hf_load", None)
++        qwen_hf_dir = _get_cfg_value(cfg, "qwen_hf_dir", None) or args.model.model_name_or_path
++        whisper_hf_dir = _get_cfg_value(cfg, "whisper_hf_dir", None) or getattr(args.model, "whisper_path", None)
++        load_visual = bool(_get_cfg_value(cfg, "load_visual", False))
++        load_audio = bool(_get_cfg_value(cfg, "load_audio", True))
++        init_audio_projector = bool(_get_cfg_value(cfg, "init_audio_projector", True))
++
++        ep_size = int(args.parallel.expert_parallel_size)
++        ep_rank = _rank()
++        if dist.is_available() and dist.is_initialized():
++            try:
++                from mindspeed_mm.fsdp.distributed.parallel_state import get_parallel_state
++
++                ps = get_parallel_state()
++                ep_rank = ps.get_ep_rank()
++                ep_size = ps.get_ep_group_size()
++            except Exception:
++                ep_rank = _rank()
++                ep_size = int(args.parallel.expert_parallel_size)
++
++        num_experts = int(self.config.text_config.num_experts)
++        if num_experts % ep_size != 0:
++            raise ValueError(f"num_experts={num_experts} is not divisible by ep_size={ep_size}")
++        local_experts = num_experts // ep_size
++        expert_start = ep_rank * local_experts
++        expert_end = expert_start + local_experts
++
++        print_rank(
++            logger.info,
++            f"[manual_ep] loading Qwen from {qwen_hf_dir}; EP rank {ep_rank}/{ep_size}, "
++            f"experts [{expert_start}, {expert_end})",
++        )
++        self._load_qwen_safetensors(qwen_hf_dir, expert_start, expert_end, load_visual=load_visual)
++
++        if load_audio:
++            self._load_whisper_safetensors(whisper_hf_dir)
++        if init_audio_projector:
++            self._init_audio_projector_from_default(whisper_hf_dir)
++
++        self._manual_ep_loaded = True
++        if dist.is_available() and dist.is_initialized():
++            dist.barrier()
++        print_rank(logger.info, "[manual_ep] weight loading complete")
++
++    def _load_qwen_safetensors(self, qwen_hf_dir: str, expert_start: int, expert_end: int, *, load_visual: bool) -> None:
++        qwen_dir = Path(qwen_hf_dir)
++        index_path = qwen_dir / "model.safetensors.index.json"
++        with index_path.open("r") as f:
++            index = json.load(f)
++
++        shard_to_keys = defaultdict(list)
++        for key, shard_file in index["weight_map"].items():
++            shard_to_keys[shard_file].append(key)
++
++        param_by_name = dict(self.named_parameters())
++        loaded = skipped = missing = 0
++        tied_loaded = 0
++
++        for shard_file in sorted(shard_to_keys):
++            shard_path = qwen_dir / shard_file
++            with safe_open(str(shard_path), framework="pt", device="cpu") as f:
++                for hf_key in f.keys():
++                    if hf_key.startswith(_MTP_PREFIX):
++                        skipped += 1
++                        continue
++                    if hf_key.startswith(_VISUAL_PREFIX) and not load_visual:
++                        skipped += 1
++                        continue
++
++                    param = _find_param(param_by_name, hf_key)
++                    if param is None:
++                        skipped += 1
++                        continue
++
++                    tensor = f.get_tensor(hf_key)
++                    if _is_expert_key(hf_key):
++                        tensor = _prepare_expert_tensor(hf_key, tensor, expert_start, expert_end)
++                        _copy_tensor_to_param(param, tensor, local_tensor=True)
++                    else:
++                        _copy_tensor_to_param(param, tensor)
++                        for tied_key, source_key in _TIE_MAPPING.items():
++                            if source_key == hf_key:
++                                tied_param = _find_param(param_by_name, tied_key)
++                                if tied_param is None:
++                                    missing += 1
++                                else:
++                                    _copy_tensor_to_param(tied_param, tensor)
++                                    tied_loaded += 1
++                    loaded += 1
++                    del tensor
++
++            gc.collect()
++            if hasattr(torch, "npu"):
++                try:
++                    torch.npu.empty_cache()
++                except Exception:
++                    pass
++
++        print_rank(
++            logger.info,
++            f"[manual_ep] qwen tensors loaded={loaded}, tied_loaded={tied_loaded}, "
++            f"skipped={skipped}, missing_tied={missing}",
++        )
++
++    def _load_whisper_safetensors(self, whisper_hf_dir: str) -> None:
++        if whisper_hf_dir is None:
++            raise ValueError("manual_ep_hf_load.whisper_hf_dir or model.whisper_path must be set")
++
++        param_by_name = dict(self.named_parameters())
++        loaded = skipped = 0
++        for shard_path in sorted(Path(whisper_hf_dir).glob("*.safetensors")):
++            state = load_file(str(shard_path), device="cpu")
++            for key, tensor in state.items():
++                if key.startswith("model.encoder."):
++                    target_key = "audio_tower.encoder." + key[len("model.encoder."):]
++                elif key.startswith("encoder."):
++                    target_key = "audio_tower.encoder." + key[len("encoder."):]
++                else:
++                    skipped += 1
++                    continue
++                param = _find_param(param_by_name, target_key)
++                if param is None:
++                    skipped += 1
++                    continue
++                _copy_tensor_to_param(param, tensor)
++                loaded += 1
++            del state
++            gc.collect()
++
++        print_rank(logger.info, f"[manual_ep] whisper encoder tensors loaded={loaded}, skipped={skipped}")
++
++    def _init_audio_projector_from_default(self, whisper_hf_dir: str) -> None:
++        whisper_config = WhisperConfig.from_pretrained(whisper_hf_dir)
++        projector = AudioProjector(
++            audio_hidden_size=whisper_config.d_model,
++            llm_hidden_size=self.config.text_config.hidden_size,
++            projector_hidden_act=getattr(self.config, "audio_projector_act", "gelu"),
++        )
++        param_by_name = dict(self.named_parameters())
++        loaded = 0
++        for key, tensor in projector.state_dict().items():
++            target_key = f"audio_projector.{key}"
++            param = _find_param(param_by_name, target_key)
++            if param is None:
++                continue
++            _copy_tensor_to_param(param, tensor)
++            loaded += 1
++        print_rank(logger.info, f"[manual_ep] audio projector tensors initialized={loaded}")
+diff --git a/mindspeed_mm/fsdp/models/qwen3_5_audio/modeling_qwen3_5_audio.py b/mindspeed_mm/fsdp/models/qwen3_5_audio/modeling_qwen3_5_audio.py
+new file mode 100644
+index 00000000..1416d2ba
+--- /dev/null
++++ b/mindspeed_mm/fsdp/models/qwen3_5_audio/modeling_qwen3_5_audio.py
+@@ -0,0 +1,205 @@
++# Copyright 2025 Huawei Technologies Co., Ltd. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Qwen3.5-35B-A3B + Whisper-large-v3 语音多模态模型（FSDP2 栈）。
++
++整体思路
++--------
++复用框架已注册的 ``Qwen3_5MoeForConditionalGeneration``（MoE 文本塔 + 视觉塔），
++通过 **子类化** 的方式挂上 Whisper audio encoder 与 projector，并重写 ``forward``：
++
++    input_features ─► WhisperAudioTower(冻结) ─► AudioProjector(可训) ─► audio_embeds
++                                                                            │ masked_scatter
++    input_ids ─► embed_tokens ─► text_embeds ───────────────────────────────┘
++                                       │
++                                 融合后的 inputs_embeds ─► super().forward(...)
++
++为什么委托给 ``super().forward``：父类已经实现了 chunk-loss、MoE aux-loss、CP-loss
++聚合等逻辑，我们只在它之前把音频特征融进 ``inputs_embeds``，避免重写损失链路引入
++数学不一致。视觉塔保留在父类里但不喂 ``pixel_values`` 即等于关闭，符合“丢弃 vision”
++的需求；如需彻底省显存可在 YAML 中 freeze ``model.visual``。
++
++数量一致性
++----------
++音频 token 数严格遵循数据侧 ``mm_plugin.py`` 的公式：
++    conv_len  = (mel_valid_frames - 1) // 2 + 1     # Whisper 卷积 2x
++    audio_len = (conv_len          - 2) // 2 + 1     # projector AvgPool 2x
++``masked_scatter`` 要求被替换元素数 == 替换源元素数，故此处裁剪逻辑必须与之一致。
++"""
++
++import logging
++from typing import Optional
++
++import torch
++from torch import nn
++from transformers.models.whisper.configuration_whisper import WhisperConfig
++
++from mindspeed.fsdp.utils.log import print_rank
++from mindspeed_mm.fsdp.utils.register import model_register
++# 注意：框架的 @model_register.register 装饰器不返回类（返回 None），
++# 因此模块里的 `Qwen3_5MoeForConditionalGeneration` 名字会被重绑为 None，不能直接 import。
++# 必须先触发该模块导入（完成注册），再从 registry 取回真正的类对象。
++import mindspeed_mm.fsdp.models.qwen3_5_moe.modeling_qwen3_5_moe  # noqa: F401  触发注册
++Qwen3_5MoeForConditionalGeneration = model_register.get("qwen3_5_moe")
++
++from .whisper_encoder import WhisperAudioTower
++from .projector import (
++    AudioProjector,
++    get_feat_lengths_after_conv,
++    get_audio_lengths_after_pool,
++)
++
++logger = logging.getLogger(__name__)
++
++# tokenizer 自带的音频占位 token id（来自 Qwen3.5-35B-A3B 的 tokenizer_config.json）。
++# <|audio_pad|> 是真正用于 masked_scatter 填充声学特征的占位符。
++DEFAULT_AUDIO_TOKEN_ID = 248076
++
++
++@model_register.register("qwen3_5_audio")
++class Qwen3_5AudioForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
++    """在 Qwen3.5-MoE 文本塔上接入 Whisper-large-v3 的语音多模态模型。"""
++
++    def __init__(self, config):
++        super().__init__(config)
++
++        # ---- audio 配置（由 overwrite_transformer_config 注入到 config）----
++        whisper_path = getattr(config, "whisper_path", None)
++        self.audio_token_id = getattr(config, "audio_token_id", DEFAULT_AUDIO_TOKEN_ID)
++        projector_act = getattr(config, "audio_projector_act", "gelu")
++
++        if whisper_path is None:
++            raise ValueError(
++                "`whisper_path` 未设置。请在 YAML 的 model 段提供 whisper_path，"
++                "指向本地 whisper-large-v3 目录（含 config.json）。"
++            )
++
++        # 仅用 config.json 构建结构（不加载权重），meta-device 初始化也安全。
++        whisper_config = WhisperConfig.from_pretrained(whisper_path)
++        self.audio_tower = WhisperAudioTower(whisper_config)
++
++        llm_hidden = config.text_config.hidden_size  # Qwen3.5-35B-A3B = 2048
++        self.audio_projector = AudioProjector(
++            audio_hidden_size=whisper_config.d_model,  # 1280
++            llm_hidden_size=llm_hidden,
++            projector_hidden_act=projector_act,
++        )
++
++        self._whisper_path = whisper_path
++
++    @staticmethod
++    def overwrite_transformer_config(transformer_config, model_args):
++        # 先沿用父类对 text_config 的覆盖（triton gdn / grouped expert matmul）。
++        transformer_config = Qwen3_5MoeForConditionalGeneration.overwrite_transformer_config(
++            transformer_config, model_args
++        )
++        # 再把 audio 相关参数从 model_args 透传到 config，供 __init__ 读取。
++        transformer_config.whisper_path = getattr(model_args, "whisper_path", None)
++        transformer_config.audio_token_id = getattr(
++            model_args, "audio_token_id", DEFAULT_AUDIO_TOKEN_ID
++        )
++        transformer_config.audio_projector_act = getattr(
++            model_args, "audio_projector_act", "gelu"
++        )
++        return transformer_config
++
++    def load_whisper_encoder(self, dtype: torch.dtype = torch.float32):
++        """从 HF whisper-large-v3 目录把 encoder 权重灌入 audio_tower。
++
++        在 meta-device 构建 + 基座 DCP 权重加载完成之后调用一次。projector 为新增
++        模块，保持随机初始化（SFT 对齐阶段从零训练）。
++        """
++        loaded = WhisperAudioTower.from_pretrained_encoder(self._whisper_path, dtype=dtype)
++        self.audio_tower.load_state_dict(loaded.state_dict())
++        print_rank(logger.info, f"[Qwen3_5Audio] whisper encoder 权重已从 {self._whisper_path} 载入")
++
++    def _get_audio_features(
++        self,
++        input_features: torch.FloatTensor,
++        feature_attention_mask: Optional[torch.Tensor],
++    ) -> torch.FloatTensor:
++        """编码音频并展平成 ``(total_audio_tokens, llm_hidden)``。
++
++        每条样本按有效长度裁剪后再过 projector，确保产出的 token 数逐条等于数据侧
++        ``<|audio_pad|>`` 的数量。
++        """
++        # WhisperEncoder 处理整段（max_length 已 pad 到 3000 mel 帧）→ (B, 1500, 1280)
++        hidden = self.audio_tower(input_features)  # (B, T_conv, 1280)
++        bsz, t_conv, _ = hidden.shape
++
++        if feature_attention_mask is not None:
++            mel_valid = feature_attention_mask.sum(-1)  # (B,) 每条有效 mel 帧数
++            conv_lens = get_feat_lengths_after_conv(mel_valid).clamp(max=t_conv)
++        else:
++            conv_lens = torch.full((bsz,), t_conv, device=hidden.device, dtype=torch.long)
++
++        per_sample = []
++        for i in range(bsz):
++            valid = int(conv_lens[i].item())
++            feat = hidden[i, :valid, :]            # (valid, 1280)
++            projected = self.audio_projector(feat)  # (audio_len, 2048)
++            per_sample.append(projected)
++
++        return torch.cat(per_sample, dim=0)  # (total_audio_tokens, 2048)
++
++    def forward(
++        self,
++        input_ids: torch.LongTensor = None,
++        attention_mask: torch.Tensor = None,
++        position_ids: torch.LongTensor = None,
++        past_key_values=None,
++        inputs_embeds: torch.FloatTensor = None,
++        labels: torch.LongTensor = None,
++        input_features: torch.FloatTensor = None,
++        feature_attention_mask: torch.Tensor = None,
++        pixel_values: torch.Tensor = None,
++        pixel_values_videos: torch.FloatTensor = None,
++        image_grid_thw: torch.LongTensor = None,
++        video_grid_thw: torch.LongTensor = None,
++        cache_position: torch.LongTensor = None,
++        logits_to_keep=0,
++        **kwargs,
++    ):
++        # 先取文本 embedding，再把音频特征 scatter 进 <|audio_pad|> 位置。
++        if inputs_embeds is None:
++            inputs_embeds = self.get_input_embeddings()(input_ids)
++
++        if input_features is not None:
++            audio_embeds = self._get_audio_features(input_features, feature_attention_mask)
++            audio_embeds = audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
++
++            audio_mask = (input_ids == self.audio_token_id).unsqueeze(-1).expand_as(inputs_embeds)
++            n_audio_pos = audio_mask[..., 0].sum()
++            if n_audio_pos != audio_embeds.shape[0]:
++                raise ValueError(
++                    f"音频 token 数不匹配：input_ids 中 <|audio_pad|> 有 {n_audio_pos} 个，"
++                    f"但 projector 产出 {audio_embeds.shape[0]} 个向量。请检查下采样公式一致性。"
++                )
++            inputs_embeds = inputs_embeds.masked_scatter(
++                audio_mask.to(inputs_embeds.device), audio_embeds
++            )
++
++        # 委托父类：input_ids 置 None（与 inputs_embeds 互斥），保留全部 loss 逻辑。
++        # 不传 pixel_values/grid_thw，即关闭视觉分支。
++        return super().forward(
++            input_ids=None,
++            attention_mask=attention_mask,
++            position_ids=position_ids,
++            past_key_values=past_key_values,
++            inputs_embeds=inputs_embeds,
++            labels=labels,
++            cache_position=cache_position,
++            logits_to_keep=logits_to_keep,
++            **kwargs,
++        )
+diff --git a/mindspeed_mm/fsdp/models/qwen3_5_audio/projector.py b/mindspeed_mm/fsdp/models/qwen3_5_audio/projector.py
+new file mode 100644
+index 00000000..dd008f4a
+--- /dev/null
++++ b/mindspeed_mm/fsdp/models/qwen3_5_audio/projector.py
+@@ -0,0 +1,95 @@
++# Copyright 2025 Huawei Technologies Co., Ltd. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Audio adapter / projector：把 Whisper encoder 的声学特征对齐到 LLM 嵌入空间。
++
++下采样数学一致性（关键！）
++--------------------------
++数据侧 ``mm_plugin.py`` 计算每条音频展开成多少个 ``<|audio_pad|>`` token：
++
++    input_lengths = (mel_valid_frames - 1) // 2 + 1     # Whisper 2 层 Conv1d(stride=2) 的输出长度
++    audio_lengths = (input_lengths      - 2) // 2 + 1     # 本 projector 的 AvgPool1d(k=2,s=2) 输出长度
++
++模型这一侧产出的音频向量数必须 **逐条等于** ``audio_lengths``，否则顶层
++``masked_scatter`` 会因元素数不匹配而报错。因此：
++
++  * Whisper encoder（whisper_encoder.py）负责第一个 2x（卷积）；
++  * 本 projector 的 ``AvgPool1d(kernel_size=2, stride=2)`` 负责第二个 2x；
++
++两者相乘即数据侧约定的 ~4x 总下采样，数量严格自洽。
++``AvgPool1d`` 无参数，纯线性平均，改动前后在数学上等价于对相邻两帧取均值，
++不破坏声学语义。
++"""
++
++import torch
++from torch import nn
++
++
++def get_feat_lengths_after_conv(mel_valid_frames: torch.Tensor) -> torch.Tensor:
++    """Whisper 2 层 stride=2 卷积后的有效帧数：``(L - 1) // 2 + 1``。"""
++    return (mel_valid_frames - 1) // 2 + 1
++
++
++def get_audio_lengths_after_pool(conv_lengths: torch.Tensor) -> torch.Tensor:
++    """AvgPool1d(k=2,s=2) 后的有效帧数：``(L - 2) // 2 + 1``。"""
++    return (conv_lengths - 2) // 2 + 1
++
++
++class AudioProjector(nn.Module):
++    """Whisper(1280) → AvgPool 2x → LayerNorm → MLP → LLM hidden(2048)。
++
++    Args:
++        audio_hidden_size: Whisper encoder 输出维度（whisper-large-v3 = 1280）。
++        llm_hidden_size:   LLM 文本塔嵌入维度（Qwen3.5-35B-A3B = 2048）。
++        projector_hidden_act: 中间激活函数名（默认 gelu）。
++    """
++
++    def __init__(
++        self,
++        audio_hidden_size: int = 1280,
++        llm_hidden_size: int = 2048,
++        projector_hidden_act: str = "gelu",
++    ):
++        super().__init__()
++        self.audio_hidden_size = audio_hidden_size
++        self.llm_hidden_size = llm_hidden_size
++
++        # 第二个 2x 下采样，与数据侧 token 数公式严格对齐。
++        self.avg_pooler = nn.AvgPool1d(kernel_size=2, stride=2)
++        self.ln_post = nn.LayerNorm(audio_hidden_size)
++        # 两层 MLP 做维度对齐（SLAM-LLM 风格的轻量 projector）。
++        self.linear_1 = nn.Linear(audio_hidden_size, llm_hidden_size, bias=True)
++        self.act = nn.GELU() if projector_hidden_act == "gelu" else nn.SiLU()
++        self.linear_2 = nn.Linear(llm_hidden_size, llm_hidden_size, bias=True)
++
++    def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
++        """
++        Args:
++            audio_features: ``(num_frames_conv, audio_hidden_size)`` —— 单条音频
++                经 Whisper encoder 后、且已按有效长度裁剪好的特征。
++
++        Returns:
++            ``(num_frames_pool, llm_hidden_size)``，其中
++            ``num_frames_pool = (num_frames_conv - 2) // 2 + 1``。
++        """
++        # AvgPool1d 作用在时间维：(T, C) -> (C, T) -> pool -> (T', C)
++        x = audio_features.transpose(0, 1).unsqueeze(0)   # (1, C, T)
++        x = self.avg_pooler(x)                             # (1, C, T')
++        x = x.squeeze(0).transpose(0, 1)                   # (T', C)
++
++        x = self.ln_post(x)
++        x = self.linear_1(x)
++        x = self.act(x)
++        x = self.linear_2(x)
++        return x
+diff --git a/mindspeed_mm/fsdp/models/qwen3_5_audio/whisper_encoder.py b/mindspeed_mm/fsdp/models/qwen3_5_audio/whisper_encoder.py
+new file mode 100644
+index 00000000..cf8eac49
+--- /dev/null
++++ b/mindspeed_mm/fsdp/models/qwen3_5_audio/whisper_encoder.py
+@@ -0,0 +1,104 @@
++# Copyright 2025 Huawei Technologies Co., Ltd. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Whisper-large-v3 audio encoder wrapper for the Qwen3.5-Audio multimodal model.
++
++设计要点
++--------
++1. 直接复用 HuggingFace transformers 的 ``WhisperEncoder``，它本身就是
++   openai/whisper-large-v3 的 encoder 部分（2 层 Conv1d + 32 层 Transformer，
++   d_model=1280）。这样权重可以零改名地从官方 ``openai/whisper-large-v3``
++   safetensors 直接加载，避免自己重写 attention 带来的数学不一致风险。
++2. 输入是 ``input_features``（mel 谱，shape ``(B, num_mel_bins, T_mel)``），
++   由数据侧的 Whisper ``feature_extractor`` 产出，与 mm_plugin 完全一致。
++3. encoder 内部 2 个 Conv1d 做 2x 下采样（stride=2），输出
++   ``(B, T_mel/2, 1280)``。后续的 4x 总下采样里，剩余的 2x 由 projector 的
++   ``AvgPool1d`` 完成，以严格对齐数据侧 token 数公式（见 projector.py）。
++"""
++
++from typing import Optional
++
++import torch
++from torch import nn
++from transformers.models.whisper.modeling_whisper import WhisperEncoder
++from transformers.models.whisper.configuration_whisper import WhisperConfig
++
++from mindspeed.fsdp.utils.log import print_rank
++import logging
++
++logger = logging.getLogger(__name__)
++
++
++class WhisperAudioTower(nn.Module):
++    """对 transformers ``WhisperEncoder`` 的薄封装。
++
++    Args:
++        config: ``WhisperConfig`` 实例（whisper-large-v3 的标准配置）。
++    """
++
++    def __init__(self, config: WhisperConfig):
++        super().__init__()
++        self.config = config
++        # 仅取 encoder，丢弃 whisper 的 decoder（ASR 解码头我们不需要）。
++        self.encoder = WhisperEncoder(config)
++        # 暴露隐藏维度，供 projector 对齐使用。whisper-large-v3 为 1280。
++        self.hidden_size = config.d_model
++
++    @property
++    def dtype(self) -> torch.dtype:
++        return next(self.parameters()).dtype
++
++    def forward(
++        self,
++        input_features: torch.FloatTensor,
++        attention_mask: Optional[torch.Tensor] = None,
++    ) -> torch.FloatTensor:
++        """
++        Args:
++            input_features: ``(B, num_mel_bins, T_mel)`` 的 mel 谱。
++            attention_mask: 透传给 WhisperEncoder（一般可为 None，
++                whisper encoder 内部按固定长度处理）。
++
++        Returns:
++            ``(B, T_mel/2, d_model)`` 的声学特征。
++        """
++        input_features = input_features.to(self.dtype)
++        encoder_outputs = self.encoder(
++            input_features=input_features,
++            attention_mask=attention_mask,
++            return_dict=True,
++        )
++        return encoder_outputs.last_hidden_state
++
++    @classmethod
++    def from_pretrained_encoder(cls, whisper_path: str, dtype: torch.dtype = torch.float32):
++        """从官方 whisper-large-v3 目录加载 encoder 权重。
++
++        只加载 encoder 子模块的权重，decoder 权重会被忽略。
++        """
++        config = WhisperConfig.from_pretrained(whisper_path)
++        module = cls(config)
++        # 用 from_pretrained 把完整 whisper 权重载入临时模型，再抽 encoder。
++        full = WhisperEncoder.from_pretrained(
++            whisper_path,
++            config=config,
++            dtype=dtype,
++        )
++        missing, unexpected = module.encoder.load_state_dict(full.state_dict(), strict=False)
++        print_rank(
++            logger.info,
++            f"[WhisperAudioTower] loaded encoder from {whisper_path}; "
++            f"missing={len(missing)} unexpected={len(unexpected)}",
++        )
++        return module
+diff --git a/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py b/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py
+index 0de69d48..9581d22f 100644
+--- a/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py
++++ b/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py
+@@ -948,11 +948,29 @@ class Qwen3_5MoeExperts(nn.Module):
+         hidden_states: torch.Tensor,
+         top_k_index: torch.Tensor,
+         top_k_weights: torch.Tensor,
+-        ep_group: ProcessGroup
++        ep_group: ProcessGroup,
++        dispatcher: str = "fused"
+     ) -> torch.Tensor:
+         gate_up_proj = self.gate_up_proj.to_local() if isinstance(self.gate_up_proj, DTensor) else self.gate_up_proj
+         down_proj = self.down_proj.to_local() if isinstance(self.down_proj, DTensor) else self.down_proj
+ 
++        # MC2: fused comm-compute overlap via npu_alltoallv_gmm/npu_gmm_alltoallv
++        if dispatcher == "mc2":
++            from mindspeed.fsdp.distributed.expert_parallel.dispatcher_mc2 import dispatch_mlp_combine
++            hidden_states_shape = hidden_states.shape
++            hidden_states = hidden_states.reshape(-1, hidden_states_shape[-1])
++            hidden_states = dispatch_mlp_combine(
++                ep_group,
++                hidden_states,
++                top_k_index,
++                top_k_weights,
++                weights=(gate_up_proj, down_proj),
++                act_fn=self.act_fn,
++                num_global_experts=self.num_experts,
++            )
++            return hidden_states.view(*hidden_states_shape)
++
++        # Default: existing fused/eager path
+         from mindspeed_mm.fsdp.distributed.expert_parallel.ep_dispatcher import ep_forward
+         hidden_states = ep_forward(
+             self.num_experts,
+@@ -961,7 +979,8 @@ class Qwen3_5MoeExperts(nn.Module):
+             hidden_states,
+             fc1_weight=gate_up_proj,
+             fc2_weight=down_proj,
+-            ep_group=ep_group
++            ep_group=ep_group,
++            fused=(dispatcher != "eager")
+         )
+         return hidden_states
+ 
+@@ -993,7 +1012,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
+         self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
+         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+ 
+-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    def forward(self, hidden_states: torch.Tensor, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+         batch_size, sequence_length, hidden_dim = hidden_states.shape
+         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+         shared_expert_output = self.shared_expert(hidden_states_reshaped)
+@@ -1695,7 +1714,18 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
+             2. Attending to all inputs
+         """
+         linear_attn_mask = attention_mask
+-        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
++        if self.training:
++            return linear_attn_mask
++
++        cache_position_start = 0
++        if cache_position is not None and cache_position.numel() > 0:
++            cache_position_start = int(cache_position.detach().cpu().flatten()[0].item())
++
++        attention_all_valid = False
++        if attention_mask is not None:
++            attention_all_valid = bool((attention_mask.detach().cpu() == 1).all().item())
++
++        if cache_position_start > 0 or attention_all_valid:
+             linear_attn_mask = None
+         return linear_attn_mask
+ 
+@@ -2620,6 +2650,3 @@ __all__ = [
+ 
+ 
+ 
+-
+-
+-
+diff --git a/mindspeed_mm/fsdp/optimizer/clip_grad_norm.py b/mindspeed_mm/fsdp/optimizer/clip_grad_norm.py
+index 76fd16a3..4bf3e4df 100644
+--- a/mindspeed_mm/fsdp/optimizer/clip_grad_norm.py
++++ b/mindspeed_mm/fsdp/optimizer/clip_grad_norm.py
+@@ -109,9 +109,12 @@ def ep_fsdp2_clip_grad_norm(
+ 
+     if max_norm == 0.:
+         return total_norm
+-    # Apply the same clip coefficient to both groups
+-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach=foreach)
+-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach=foreach)
++    # Apply the same clip coefficient to both groups. LoRA-only training can
++    # legitimately leave one group empty on a rank after EP/FSDP partitioning.
++    if ep_params:
++        torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach=foreach)
++    if non_ep_params:
++        torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach=foreach)
+ 
+     return total_norm
+ 
+@@ -125,6 +128,8 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
+     ]
+     default_device = grads_local[0].device if len(grads_local) > 0 else torch.device(get_device_type())
+     res = torch.tensor(0.0, device=default_device, dtype=torch.float32)
++    if len(grads_local) == 0:
++        return res
+     with torch.no_grad():
+         grouped_grads_local = _group_tensors_by_device_and_dtype([grads_local])
+         for (device, _), ([device_grads_local], _) in grouped_grads_local.items():
+diff --git a/mindspeed_mm/fsdp/params/training_args.py b/mindspeed_mm/fsdp/params/training_args.py
+index b2a5998e..1567fbe3 100644
+--- a/mindspeed_mm/fsdp/params/training_args.py
++++ b/mindspeed_mm/fsdp/params/training_args.py
+@@ -63,11 +63,65 @@ class Profiler:
+             self.profile_this_rank = False
+ 
+ 
++@dataclass
++class ManualEPHFLoad:
++    enable: bool = field(
++        default=False,
++        metadata={"help": "Enable manual HF safetensors loading for expert-parallel Qwen3.5 MoE."},
++    )
++    qwen_hf_dir: Optional[str] = field(
++        default=None,
++        metadata={"help": "Path to the Qwen HF checkpoint directory."},
++    )
++    whisper_hf_dir: Optional[str] = field(
++        default=None,
++        metadata={"help": "Path to the Whisper HF checkpoint directory."},
++    )
++    load_visual: bool = field(
++        default=False,
++        metadata={"help": "Whether to load visual tower weights."},
++    )
++    load_audio: bool = field(
++        default=True,
++        metadata={"help": "Whether to load Whisper audio encoder weights."},
++    )
++    init_audio_projector: bool = field(
++        default=True,
++        metadata={"help": "Whether to initialize audio projector weights."},
++    )
++
++
++@dataclass
++class PerfTiming:
++    enable: bool = field(
++        default=False,
++        metadata={"help": "Enable per-step phase timing logs for performance analysis."},
++    )
++    sync: bool = field(
++        default=True,
++        metadata={"help": "Synchronize NPU before phase timing boundaries for accurate measurements."},
++    )
++    log_tokens: bool = field(
++        default=True,
++        metadata={"help": "Log global input, label, and audio-pad token counts for WPS calculation."},
++    )
++    log_micro_steps: bool = field(
++        default=False,
++        metadata={"help": "Log rank-0 micro-step phase markers for hang diagnosis."},
++    )
++    diagnostic_sync_phases: List[str] = field(
++        default_factory=list,
++        metadata={"help": "NPU-synchronize after named phases for hang diagnosis. Example: ['forward', 'backward', 'clip']."},
++    )
++
++
+ @allow_extra_fields
+ @dataclass
+ class TrainingArguments:
+     profile: Profiler = field(default_factory=Profiler)
+     lora: LoraArguments = field(default_factory=LoraArguments)
++    manual_ep_hf_load: ManualEPHFLoad = field(default_factory=ManualEPHFLoad)
++    perf_timing: PerfTiming = field(default_factory=PerfTiming)
+     lr: float = field(
+         default=5e-5,
+         metadata={"help": "Maximum learning rate or defult learning rate, or init learning rate for warmup."},
+@@ -128,6 +182,14 @@ class TrainingArguments:
+         default=None,
+         metadata={"help": "Gradient accumulation steps. If None, use `global_batch_size` // (`micro_batch_size` * data_parallel_size)."},
+     )
++    gradient_accumulation_no_sync: bool = field(
++        default=False,
++        metadata={"help": "Use model.no_sync() for non-final micro-steps during gradient accumulation."},
++    )
++    empty_cache_interval: int = field(
++        default=0,
++        metadata={"help": "Call torch.npu.empty_cache() every N optimizer steps. 0 disables it."},
++    )
+     lr_warmup_ratio: float = field(
+         default=0.0,
+         metadata={"help": "Ratio of learning rate warmup steps."},
+diff --git a/mindspeed_mm/fsdp/train/train_engine.py b/mindspeed_mm/fsdp/train/train_engine.py
+index 703c043b..648ed29a 100644
+--- a/mindspeed_mm/fsdp/train/train_engine.py
++++ b/mindspeed_mm/fsdp/train/train_engine.py
+@@ -1,4 +1,6 @@
+ import logging
++import time
++from contextlib import nullcontext
+ from datetime import datetime
+ 
+ import torch
+@@ -42,6 +44,91 @@ class TrainEngine:
+         self.profiler = Profiler(args.tools.profile)
+         self.profiler.start()
+ 
++    def _perf_timing_enabled(self):
++        return bool(getattr(getattr(self.args.training, "perf_timing", None), "enable", False))
++
++    def _perf_timing_cfg(self):
++        return getattr(self.args.training, "perf_timing", None)
++
++    def _perf_sync(self):
++        timing_cfg = self._perf_timing_cfg()
++        if not bool(getattr(timing_cfg, "enable", False)) or not bool(getattr(timing_cfg, "sync", True)):
++            return
++        if hasattr(torch, "npu") and torch.npu.is_available():
++            torch.npu.synchronize()
++
++    def _diagnostic_sync(self, phase):
++        timing_cfg = self._perf_timing_cfg()
++        phases = getattr(timing_cfg, "diagnostic_sync_phases", []) or []
++        if phase not in phases:
++            return
++        if hasattr(torch, "npu") and torch.npu.is_available():
++            torch.npu.synchronize()
++
++    def _log_micro_phase(self, iteration, accum_step, accum_steps, phase, event):
++        timing_cfg = self._perf_timing_cfg()
++        if not bool(getattr(timing_cfg, "log_micro_steps", False)):
++            return
++        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
++            return
++        print_rank(
++            logger.info,
++            f"[perf_micro] iter={iteration + 1} accum={accum_step + 1}/{accum_steps} phase={phase} event={event}",
++        )
++
++    def _perf_now(self):
++        self._perf_sync()
++        return time.perf_counter()
++
++    def _perf_elapsed(self, start):
++        self._perf_sync()
++        return time.perf_counter() - start
++
++    def _collect_token_counts(self, batch_data):
++        timing_cfg = self._perf_timing_cfg()
++        if not bool(getattr(timing_cfg, "log_tokens", True)):
++            return {"input_tokens": 0, "label_tokens": 0, "audio_tokens": 0}
++
++        device = None
++        input_tokens = torch.tensor(0, dtype=torch.long)
++        label_tokens = torch.tensor(0, dtype=torch.long)
++        audio_tokens = torch.tensor(0, dtype=torch.long)
++
++        input_ids = batch_data.get("input_ids")
++        if isinstance(input_ids, torch.Tensor):
++            device = input_ids.device
++            if "attention_mask" in batch_data and isinstance(batch_data["attention_mask"], torch.Tensor):
++                input_tokens = batch_data["attention_mask"].sum(dtype=torch.long)
++            else:
++                input_tokens = torch.tensor(input_ids.numel(), device=device, dtype=torch.long)
++            audio_token_id = getattr(self.args.model, "audio_token_id", None)
++            if audio_token_id is not None:
++                audio_tokens = (input_ids == int(audio_token_id)).sum(dtype=torch.long)
++
++        labels = batch_data.get("labels")
++        if isinstance(labels, torch.Tensor):
++            if device is None:
++                device = labels.device
++            label_tokens = (labels != -100).sum(dtype=torch.long)
++
++        if device is None:
++            return {"input_tokens": 0, "label_tokens": 0, "audio_tokens": 0}
++
++        stats = torch.stack([
++            input_tokens.to(device=device, dtype=torch.long),
++            label_tokens.to(device=device, dtype=torch.long),
++            audio_tokens.to(device=device, dtype=torch.long),
++        ])
++        if torch.distributed.is_initialized():
++            ps = get_parallel_state()
++            torch.distributed.all_reduce(stats, group=ps.get_dp_group())
++
++        return {
++            "input_tokens": int(stats[0].item()),
++            "label_tokens": int(stats[1].item()),
++            "audio_tokens": int(stats[2].item()),
++        }
++
+     def average_losses_across_data_parallel_group(self, losses):
+         """Reduce a tensor of losses across all GPUs."""
+         ps = get_parallel_state()
+@@ -84,30 +171,83 @@ class TrainEngine:
+         """Perform a single training step with gradient accumulation."""
+         args = self.args
+         total_loss = 0
++        perf_enabled = self._perf_timing_enabled()
++        perf = {
++            "get_batch_s": 0.0,
++            "move_s": 0.0,
++            "loss_setup_s": 0.0,
++            "forward_s": 0.0,
++            "backward_s": 0.0,
++            "input_tokens": 0,
++            "label_tokens": 0,
++            "audio_tokens": 0,
++        }
+         # Gradient accumulation
+-        for _ in range(args.training.gradient_accumulation_steps):
++        accum_steps = args.training.gradient_accumulation_steps
++        use_no_sync = bool(getattr(args.training, "gradient_accumulation_no_sync", False))
++        for accum_step in range(accum_steps):
+             # Get current batch data
++            self._log_micro_phase(self.iteration, accum_step, accum_steps, "get_batch", "start")
++            t0 = self._perf_now() if perf_enabled else None
+             batch_data = self.get_batch(train_dataloader_iter)
++            self._diagnostic_sync("get_batch")
++            if perf_enabled:
++                perf["get_batch_s"] += self._perf_elapsed(t0)
++            self._log_micro_phase(self.iteration, accum_step, accum_steps, "get_batch", "end")
+ 
+             # Move input to device and cast precision
++            self._log_micro_phase(self.iteration, accum_step, accum_steps, "move", "start")
++            t0 = self._perf_now() if perf_enabled else None
+             batch_data = move_to_device(batch_data, get_dtype(args.parallel.fsdp_plan.param_dtype) if args.parallel.fsdp_plan.param_dtype else None)
++            self._diagnostic_sync("move")
++            if perf_enabled:
++                perf["move_s"] += self._perf_elapsed(t0)
++                token_counts = self._collect_token_counts(batch_data)
++                for key, value in token_counts.items():
++                    perf[key] += value
++            self._log_micro_phase(self.iteration, accum_step, accum_steps, "move", "end")
+ 
+             # setup loss ctx
++            self._log_micro_phase(self.iteration, accum_step, accum_steps, "loss_setup", "start")
++            t0 = self._perf_now() if perf_enabled else None
+             self.set_loss_func(batch_data)
+-
+-            # forward step
+-            output = self.model(**batch_data)
+-            loss = output.loss / args.training.gradient_accumulation_steps
+-
+-            # Backward
+-            loss.backward()
++            self._diagnostic_sync("loss_setup")
++            if perf_enabled:
++                perf["loss_setup_s"] += self._perf_elapsed(t0)
++            self._log_micro_phase(self.iteration, accum_step, accum_steps, "loss_setup", "end")
++
++            sync_context = nullcontext
++            if use_no_sync and accum_step < accum_steps - 1 and hasattr(self.model, "no_sync"):
++                sync_context = self.model.no_sync
++
++            with sync_context():
++                # forward step
++                self._log_micro_phase(self.iteration, accum_step, accum_steps, "forward", "start")
++                t0 = self._perf_now() if perf_enabled else None
++                output = self.model(**batch_data)
++                loss = output.loss / accum_steps
++                self._diagnostic_sync("forward")
++                if perf_enabled:
++                    perf["forward_s"] += self._perf_elapsed(t0)
++                self._log_micro_phase(self.iteration, accum_step, accum_steps, "forward", "end")
++
++                # Backward
++                self._log_micro_phase(self.iteration, accum_step, accum_steps, "backward", "start")
++                t0 = self._perf_now() if perf_enabled else None
++                loss.backward()
++                self._diagnostic_sync("backward")
++                if perf_enabled:
++                    perf["backward_s"] += self._perf_elapsed(t0)
++                self._log_micro_phase(self.iteration, accum_step, accum_steps, "backward", "end")
+ 
+             total_loss += loss
+ 
+         # Average loss across data parallel group
+         total_loss = self.average_losses_across_data_parallel_group([total_loss])
+ 
+-        return total_loss
++        if perf_enabled:
++            return total_loss, perf
++        return total_loss, None
+ 
+     def train(self):
+         """Main training loop."""
+@@ -124,21 +264,56 @@ class TrainEngine:
+             memory_profiler.step()
+             start_time = get_time(barrier=True)
+ 
++            perf_enabled = self._perf_timing_enabled()
++            pregather_s = 0.0
+             if self.args.parallel.fsdp_plan.pregather:
++                t0 = self._perf_now() if perf_enabled else None
+                 pregather_fsdp_params(self.model)
++                if perf_enabled:
++                    pregather_s = self._perf_elapsed(t0)
+ 
+-            loss = self.train_step(train_dataloader_iter)
++            loss, perf_info = self.train_step(train_dataloader_iter)
++            if perf_info is not None:
++                perf_info["pregather_s"] = pregather_s
+ 
+             # Clip gradients when clip_grad>0 and get total grad_norm
++            self._log_micro_phase(self.iteration, 0, 1, "clip", "start")
++            t0 = self._perf_now() if perf_enabled else None
+             grad_norm = clip_grad_norm(self.model, max_norm=args.training.clip_grad, foreach=args.training.clip_grad_foreach)
++            self._diagnostic_sync("clip")
++            if perf_info is not None:
++                perf_info["clip_s"] = self._perf_elapsed(t0)
++            self._log_micro_phase(self.iteration, 0, 1, "clip", "end")
+ 
+             # Update parameters
++            self._log_micro_phase(self.iteration, 0, 1, "optimizer", "start")
++            t0 = self._perf_now() if perf_enabled else None
+             self.optimizer.step()
++            self._diagnostic_sync("optimizer")
++            if perf_info is not None:
++                perf_info["optimizer_s"] = self._perf_elapsed(t0)
++            self._log_micro_phase(self.iteration, 0, 1, "optimizer", "end")
++            t0 = self._perf_now() if perf_enabled else None
+             self.lr_scheduler.step()
++            if perf_info is not None:
++                perf_info["lr_scheduler_s"] = self._perf_elapsed(t0)
++            t0 = self._perf_now() if perf_enabled else None
+             self.optimizer.zero_grad()
++            if perf_info is not None:
++                perf_info["zero_grad_s"] = self._perf_elapsed(t0)
++            empty_cache_interval = int(getattr(args.training, "empty_cache_interval", 0) or 0)
++            if empty_cache_interval > 0 and (self.iteration + 1) % empty_cache_interval == 0:
++                t0 = self._perf_now() if perf_enabled else None
++                if hasattr(torch, "npu") and torch.npu.is_available():
++                    torch.npu.empty_cache()
++                if perf_info is not None:
++                    perf_info["empty_cache_s"] = self._perf_elapsed(t0)
+ 
+             # Stop profiling if enabled
++            t0 = self._perf_now() if perf_enabled else None
+             self.profiler.step()
++            if perf_info is not None:
++                perf_info["profiler_s"] = self._perf_elapsed(t0)
+ 
+             # Update training state
+             self.consumed_train_samples += args.training.global_batch_size
+@@ -155,7 +330,8 @@ class TrainEngine:
+                     curr_step_lr,
+                     self.consumed_train_samples,
+                     loss,
+-                    grad_norm
++                    grad_norm,
++                    perf_info
+                 )
+ 
+             curr_step_lr = self.lr_scheduler.get_last_lr()[0]
+@@ -178,7 +354,8 @@ class TrainEngine:
+         curr_step_lr,
+         consumed_train_samples,
+         loss,
+-        grad_norm
++        grad_norm,
++        perf_info=None,
+     ):
+         args = self.args
+         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+@@ -193,6 +370,31 @@ class TrainEngine:
+         log_string += ' loss: {:.6E} |'.format(loss.item())
+         if grad_norm is not None:
+             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
++        if perf_info is not None:
++            total_s = elapsed_time_per_iteration if elapsed_time_per_iteration is not None else 0.0
++            input_tokens = perf_info.get("input_tokens", 0)
++            label_tokens = perf_info.get("label_tokens", 0)
++            audio_tokens = perf_info.get("audio_tokens", 0)
++            input_wps = input_tokens / total_s if total_s > 0 else 0.0
++            label_wps = label_tokens / total_s if total_s > 0 else 0.0
++            audio_wps = audio_tokens / total_s if total_s > 0 else 0.0
++            log_string += (
++                " perf timing ms: "
++                f"pregather={perf_info.get('pregather_s', 0.0) * 1000.0:.1f}, "
++                f"get_batch={perf_info.get('get_batch_s', 0.0) * 1000.0:.1f}, "
++                f"move={perf_info.get('move_s', 0.0) * 1000.0:.1f}, "
++                f"loss_setup={perf_info.get('loss_setup_s', 0.0) * 1000.0:.1f}, "
++                f"forward={perf_info.get('forward_s', 0.0) * 1000.0:.1f}, "
++                f"backward={perf_info.get('backward_s', 0.0) * 1000.0:.1f}, "
++                f"clip={perf_info.get('clip_s', 0.0) * 1000.0:.1f}, "
++                f"optimizer={perf_info.get('optimizer_s', 0.0) * 1000.0:.1f}, "
++                f"lr_scheduler={perf_info.get('lr_scheduler_s', 0.0) * 1000.0:.1f}, "
++                f"zero_grad={perf_info.get('zero_grad_s', 0.0) * 1000.0:.1f}, "
++                f"empty_cache={perf_info.get('empty_cache_s', 0.0) * 1000.0:.1f}, "
++                f"profiler={perf_info.get('profiler_s', 0.0) * 1000.0:.1f} | "
++                f"tokens: input={input_tokens}, label={label_tokens}, audio={audio_tokens} | "
++                f"wps: input={input_wps:.1f}, label={label_wps:.1f}, audio={audio_wps:.1f} |"
++            )
+ 
+         print_rank(logger.info, log_string)
+ 
+@@ -264,4 +466,4 @@ class TrainEngine:
+         self.checkpointer.save(args.training.save, state=state, iteration=iteration)
+ 
+         # Synchronize all processes after saving
+-        torch.distributed.barrier()
+\ No newline at end of file
++        torch.distributed.barrier()
+diff --git a/mindspeed_mm/fsdp/train/trainer.py b/mindspeed_mm/fsdp/train/trainer.py
+index 29e30e63..4fff35b2 100644
+--- a/mindspeed_mm/fsdp/train/trainer.py
++++ b/mindspeed_mm/fsdp/train/trainer.py
+@@ -1,4 +1,6 @@
+ from dataclasses import MISSING, asdict, dataclass, field, fields
++import faulthandler
++import signal
+ from typing import Any, Callable, Dict, List, Literal, Optional, TypeVar, Union, get_type_hints
+ import logging
+ import os
+@@ -109,6 +111,10 @@ class Trainer():
+     def initialize(self):
+         """Initialize training environment: logging, random seeds, distributed groups."""
+         args: Arguments = self.args
++        try:
++            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
++        except (RuntimeError, ValueError):
++            pass
+         print_rank(logger.info, f"Start initializing training environment!!!")
+ 
+         # Set allow_hf32
+@@ -160,16 +166,79 @@ class Trainer():
+ 
+         # Initialize weights on meta device if specified (for memory efficiency)
+         if args.training.init_model_with_meta_device:
+-            if args.training.load is None and args.training.load_rank0_and_broadcast:
++            manual_ep_cfg = getattr(args.training, "manual_ep_hf_load", None)
++            manual_ep_enabled = bool(getattr(manual_ep_cfg, "enable", False))
++            if manual_ep_enabled:
++                to_empty_if_needed(model, device=get_device_type())
++                manual_loader = getattr(model, "load_manual_ep_weights", None)
++                if not callable(manual_loader):
++                    raise ValueError(
++                        "training.manual_ep_hf_load.enable is true, but the selected model "
++                        "does not implement load_manual_ep_weights()."
++                    )
++                manual_loader(args)
++                if args.training.lora.enable:
++                    self._enforce_lora_only_trainable(model)
++                    self._reset_lora_params(model)
++            elif args.training.load is None and args.training.load_rank0_and_broadcast:
+                 raise ValueError("Must set `training.load` when `training.load_rank0_and_broadcast` is True, otherwise the model will be initialized with meta device but no weights will be loaded.")
+             elif args.training.load is None and not args.training.load_rank0_and_broadcast:
+                 to_empty_if_needed(model, device=get_device_type())
+                 init_model_weights(model)
+             elif not args.training.load_rank0_and_broadcast:
+                 to_empty_if_needed(model, device=get_device_type())
++                # FIX: meta_device + DCP load 路径下 to_empty 会把 LoRA 参数初始化为 0
++                # (DCP 里没 LoRA 权重,基模型由后续 DCP load 覆盖,但 LoRA 仍是全 0).
++                # 标准 LoRA 初始化要求 lora_A 用 kaiming 随机,lora_B 保持 0;两者都 0 会
++                # 让 LoRA 输出恒为 0、梯度断流 (grad norm=0,loss 横盘).
++                if args.training.lora.enable:
++                    self._reset_lora_params(model)
+ 
+         return model
+ 
++    @staticmethod
++    def _enforce_lora_only_trainable(model: torch.nn.Module) -> None:
++        """Keep only LoRA adapter tensors trainable after FSDP/EP wrapping."""
++        trainable = 0
++        total = 0
++        for name, param in model.named_parameters():
++            total += 1
++            is_lora_param = "lora_" in name and "base_layer" not in name
++            param.requires_grad_(is_lora_param)
++            if is_lora_param:
++                trainable += 1
++        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
++            logger.info(f"[LoRA fix] post-FSDP trainable tensors: {trainable}/{total} (LoRA only)")
++
++    @staticmethod
++    def _reset_lora_params(model: torch.nn.Module) -> None:
++        """重置 LoRA 适配器参数: lora_A 用 kaiming, lora_B 用小随机值.
++
++        注: 标准 LoRA 用 B=0,但在本框架 (FSDP2 composable + NPU bf16/fp32 混精度
++        + activation checkpoint) 下,B=0 时 lora_out 恒为 0,反向传播链会因数值/计算图
++        优化退化(grad norm=0,LoRA 完全不更新). 经实验验证,改用 small normal (std=0.01)
++        既能让梯度链正常流动,对训练初期影响也极小(初始 |scaling*B*A*x|≈0.01,远小于
++        base_layer 输出量级)."""
++        import math
++        from torch.distributed.tensor import DTensor
++        n_a, n_b = 0, 0
++        for name, param in model.named_parameters():
++            if "lora_A" not in name and "lora_B" not in name:
++                continue
++            with torch.no_grad():
++                # FSDP2 下 LoRA 参数是 DTensor,需要拿 local 张量初始化
++                tgt = param.data.to_local() if isinstance(param.data, DTensor) else param.data
++                if "lora_A" in name:
++                    # PEFT 默认 a=sqrt(5) 的 kaiming_uniform_
++                    torch.nn.init.kaiming_uniform_(tgt, a=math.sqrt(5))
++                    n_a += 1
++                else:  # lora_B
++                    # 关键: B 用小随机值代替 0,避免 FSDP2+NPU 下梯度链退化
++                    torch.nn.init.normal_(tgt, mean=0.0, std=0.01)
++                    n_b += 1
++        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
++            logger.info(f"[LoRA fix] re-initialized lora_A={n_a} (kaiming), lora_B={n_b} (small_normal std=0.01)")
++
+     def enable_lora(self, model: torch.nn.Module) -> torch.nn.Module:
+         """
+         Enable LoRA fine-tuning by injecting LoRA adapters into model.
+@@ -325,4 +394,4 @@ if __name__ == "__main__":
+     # Entry point for training script
+     args = parse_args(Arguments)
+     trainer = Trainer(args=args)
+-    trainer.train()
+\ No newline at end of file
++    trainer.train()
+diff --git a/mindspeed_mm/fsdp/utils/lora_weight_manager.py b/mindspeed_mm/fsdp/utils/lora_weight_manager.py
+index 9b39065c..1f80e81c 100644
+--- a/mindspeed_mm/fsdp/utils/lora_weight_manager.py
++++ b/mindspeed_mm/fsdp/utils/lora_weight_manager.py
+@@ -369,10 +369,13 @@ class LoraWeightManager:
+         
+         for name, param in lora_params:
+             param_data = self._gather_dtensor(param.data) if self._is_dtensor(param.data) else param.data
++            # 修复: meta device 上的 tensor 无实际数据，跳过 NaN/Inf 检查
++            if param_data.is_meta:
++                continue
+             if param_data.isnan().any():
+                 logger.error(f"LoRA parameter {name} contains NaN values")
+                 return False
+-            
++
+             if param_data.isinf().any():
+                 logger.error(f"LoRA parameter {name} contains Inf values")
+                 return False

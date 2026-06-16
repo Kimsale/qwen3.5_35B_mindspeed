@@ -23,6 +23,14 @@ baseline_26/
 │   ├── qwen35_audio_manual_ep8_perf_tuning_20260616.md  # 最新性能调优报告
 │   └── ...                           # 历史报告
 │
+├── mindspeed_mm_patches/             # **MindSpeed-MM 26.0.0 源码改动 (patch)**
+│   ├── README.md                     # 版本锚点 + 复现步骤 + 与报告对应关系
+│   ├── 01_source_code.patch          # 框架源码改动 (MC2 核心 + 音频插件)
+│   ├── 02_examples_configs.patch     # 训练脚本 + 221 个 perf_tuning yaml
+│   └── 00_full_commit_46de4e18.patch # 全量兜底
+│
+├── configs/perf_tuning/              # 头牌配置便捷副本 (fused 基线 vs MC2)
+│
 └── scripts/                          # 训练&调试脚本
     ├── train_qwen35_audio.sh         # 训练启动脚本
     ├── train_qwen35_audio.yaml       # 训练配置
