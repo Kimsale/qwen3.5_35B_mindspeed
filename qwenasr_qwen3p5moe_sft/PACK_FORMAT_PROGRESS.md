@@ -1,5 +1,25 @@
 # Pack格式实施进度报告
 
+## 验证状态总览 (2026-06-16 更新)
+
+| 项目 | 状态 | 说明 |
+|------|------|------|
+| PackedDataCollator 逻辑 | ✅ 已验证 (CPU) | test_packed_collator_standalone.py 全过 |
+| 打包 attention 正确性 | ✅ 已验证 (CPU) | test_packed_mask.py 5项全过(无NaN/因果/无泄露/reshape/边界) |
+| 原生 FA2 varlen 检测 | ✅ 已验证 (CPU) | 用真实 transformers 函数确认 position_ids→cu_seqlens 正确 |
+| 数学等价性论证 | ✅ 已论证 | 每样本首token必为-100(_build_labels),边界shift无污染 |
+| model_ep.py forward 改造 | ✅ 代码完成 | 原生 varlen 路径,语法检查通过 |
+| train_ep.py 训练循环适配 | ✅ 代码完成 | loss bucket/调试输出/--use_packed_format/--max_steps |
+| EP MoE 兼容性 | ✅ 已分析 | token级all-to-all,batch无关,无需改动 |
+| **端到端 8卡 smoke test** | ⏳ **被阻塞** | **NPU 0-7 全部被其他作业占满(~65GB/卡)** |
+| 数值一致性(pack vs pad实跑) | ⏳ 待硬件 | 需 NPU 空闲后运行 |
+| 性能对比(显存/吞吐/AICore) | ⏳ 待硬件 | 需 NPU 空闲后运行 |
+
+**结论**: 代码与逻辑层面全部完成并通过 CPU 级验证;实跑验证(数值一致性+性能)
+等待 NPU 资源释放。运行命令已就绪: `bash test_pack_smoke.sh pack`。
+
+---
+
 ## 阶段1: 原型验证 [✅ 已完成 100%]
 
 ### 已完成任务
