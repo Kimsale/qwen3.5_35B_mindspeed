@@ -4,6 +4,16 @@
 
 已成功实现LLM训练的Pack格式优化,通过消除padding浪费提升训练效率。
 
+> **关键架构修正 (2026-06-16)**: 经对照 transformers 4.57.0 的 Qwen3-MoE 建模源码,
+> 最初设想的 "block-diagonal attention mask" 方案存在致命缺陷——稠密 mask 为
+> O(total_len²),在 batch_tokens=100k 时单个 mask 张量即约 20GB,必然 OOM,
+> 彻底抵消 packing 的收益。**已改用 transformers 原生 FlashAttention-2 varlen 路径**:
+> 仅传 `position_ids`(每样本从 0 重启)、`attention_mask=None`,框架经
+> `_is_packed_sequence(position_ids)` 自动检测打包并路由到
+> `npu_flash_attn_varlen_func`,由 position_ids 推导 cu_seqlens,
+> 计算为 O(Σ seqᵢ²) 且**零 mask 显存**。这比原计划的 "mask 兜底" 更优,是完整 varlen 优化。
+> 稠密 mask 函数 `_create_packed_attention_mask` 保留为 SDPA/eager 环境的 fallback。
+
 ## 核心改动
 
 ### 1. 数据层: PackedDataCollator

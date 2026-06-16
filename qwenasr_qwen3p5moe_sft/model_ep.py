@@ -381,6 +381,12 @@ def load_llm_with_ep(model_path, ep_size, ep_rank, device):
     """
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     config.use_cache = False
+    # FlashAttention-2 enables the native varlen packing path: when position_ids
+    # indicate packed sequences (reset to 0 per sample), transformers routes through
+    # flash_attn_varlen_func / npu_flash_attn_varlen_func with cu_seqlens derived from
+    # position_ids — O(sum seq_i^2) cost, zero mask materialization. This is what makes
+    # pack format actually save memory (a dense block-diagonal mask would be O(total_len^2)).
+    config._attn_implementation = 'flash_attention_2'
 
     num_experts = config.num_experts
     num_local_experts = num_experts // ep_size
@@ -697,32 +703,36 @@ class EPSpeechTranslationModel(nn.Module):
         inputs_embeds = inputs_embeds.to(dtype=torch.bfloat16)
 
         # 4. LLM forward (with EP MoE blocks)
-        # Pack format strategy: treat the packed stream as a single batch=1 sequence and
-        # supply a block-diagonal causal mask so samples cannot attend across boundaries.
-        # The HF model derives seq_len from inputs_embeds.shape[1], so packed tensors MUST
-        # carry a leading batch dim: (1, total_len, hidden). position_ids/labels likewise.
+        # Pack format strategy: NATIVE FlashAttention-2 varlen path.
+        # Treat the packed stream as a single batch=1 sequence (1, total_len, hidden) and pass
+        # position_ids that reset to 0 at each sample start (built by PackedDataCollator).
+        # With _attn_implementation='flash_attention_2', transformers detects packing via
+        # _is_packed_sequence(position_ids) and routes attention through
+        # npu_flash_attn_varlen_func, deriving cu_seqlens from position_ids. This is O(sum
+        # seq_i^2) with ZERO mask materialization — a dense block-diagonal mask would be
+        # O(total_len^2) (~20GB at batch_tokens=100k) and defeat the purpose of packing.
+        #
         # Mathematical equivalence to per-sample forward holds because:
-        #   - block-diagonal mask isolates samples (no cross-sample attention)
-        #   - position_ids restart at 0 per sample (set by PackedDataCollator)
-        #   - HF's internal causal-shift loss only contaminates at sample boundaries,
-        #     and those boundary labels are -100 (prompt/audio tokens) -> ignored.
+        #   - varlen attention isolates samples via cu_seqlens (no cross-sample attention)
+        #   - position_ids restart at 0 per sample -> correct per-sample RoPE
+        #   - HF's internal causal-shift loss only contaminates at sample boundaries, and
+        #     those boundary labels are -100 (prompt/audio tokens) -> ignored.
         if is_packed:
-            # Add leading batch dim for the LLM (batch=1)
+            # Add leading batch dim for the LLM (batch=1). attention_mask MUST be None so
+            # the FA2 varlen path is taken (a non-None mask forces the dense unpad path).
             inputs_embeds = inputs_embeds.unsqueeze(0)                      # (1, total_len, hidden)
             llm_position_ids = position_ids.unsqueeze(0) if position_ids is not None else None
             llm_labels = labels.unsqueeze(0) if labels is not None else None
-            if attention_mask is None:
-                attention_mask = self._create_packed_attention_mask(
-                    cu_seqlens, total_len, device, inputs_embeds.dtype
-                )
+            llm_attention_mask = None
         else:
             llm_position_ids = position_ids
             llm_labels = labels
+            llm_attention_mask = attention_mask
 
         outputs = self.llm(
             inputs_embeds=inputs_embeds,
             position_ids=llm_position_ids,
-            attention_mask=attention_mask,
+            attention_mask=llm_attention_mask,
             labels=llm_labels,
             return_dict=True,
         )
@@ -735,15 +745,20 @@ class EPSpeechTranslationModel(nn.Module):
         return outputs
 
     def _create_packed_attention_mask(self, cu_seqlens, total_len, device, dtype=torch.bfloat16):
-        """Create block-diagonal causal attention mask for packed sequences.
+        """Block-diagonal causal mask — FALLBACK only (not used on the FA2 varlen path).
 
-        Each sample can only attend to tokens within its own sequence (cu_seqlens boundaries),
-        and must respect causal masking (can't attend to future tokens).
+        The default packed forward uses the native FlashAttention-2 varlen path
+        (driven by position_ids), which needs NO materialized mask. This helper is
+        retained for SDPA/eager environments where FA2 is unavailable; callers must be
+        aware it allocates an O(total_len^2) tensor and is unsuitable for large
+        batch_tokens (e.g. ~20GB at total_len=100k).
+
+        Each sample attends only within its own sequence (cu_seqlens boundaries) and
+        respects causal masking.
 
         Returns:
-            attention_mask: (1, 1, total_len, total_len) additive float mask, broadcast over
-            batch and heads. 0.0 = attend, large-negative = masked. This is the format the
-            transformers SDPA/eager attention path consumes when a custom 4D mask is supplied.
+            (1, 1, total_len, total_len) additive float mask, broadcast over batch and
+            heads. 0.0 = attend, large-negative = masked.
         """
         batch_size = len(cu_seqlens) - 1
         # Most-negative finite value for this dtype (avoid -inf so that fully-masked rows,
