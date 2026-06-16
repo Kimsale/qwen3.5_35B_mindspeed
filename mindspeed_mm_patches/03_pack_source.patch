@@ -1,0 +1,320 @@
+diff --git a/mindspeed_mm/fsdp/data/dataloader/data_collator.py b/mindspeed_mm/fsdp/data/dataloader/data_collator.py
+index c84cb88f..3895c68d 100644
+--- a/mindspeed_mm/fsdp/data/dataloader/data_collator.py
++++ b/mindspeed_mm/fsdp/data/dataloader/data_collator.py
+@@ -5,6 +5,7 @@ from mindspeed_mm.fsdp.data.data_utils.func_utils.convert import load_tokenizer,
+ from mindspeed_mm.fsdp.data.data_utils.func_utils.model_args import ProcessorArguments
+ from mindspeed_mm.fsdp.data.data_utils.func_utils.template import get_template_and_fix_tokenizer
+ from mindspeed_mm.fsdp.distributed.parallel_state import get_parallel_state
++from .packed_collator_wrapper import PackedCollatorWrapper
+ 
+ 
+ class DataCollatorForQwen2vl:
+@@ -32,6 +33,33 @@ class DataCollatorForQwen2vl:
+         return self.data_collator(*args, **kwargs)
+ 
+ 
++class DataCollatorForQwen2vlPacked:
++    """Pack format collator: wraps DataCollatorForQwen2vl to eliminate padding waste."""
++
++    def __init__(self, ignore_pad_token_for_loss: bool, dataset_param=None, **kwargs):
++        process_args = ProcessorArguments(**dataset_param.preprocess_parameters.to_dict())
++        tokenizer_module = load_tokenizer(process_args)
++        tokenizer = tokenizer_module.get('tokenizer')
++        template = get_template_and_fix_tokenizer(tokenizer, dataset_param.basic_parameters.template)
++
++        # Create base collator (pad format)
++        base_collator = MultiModalDataCollatorForSeq2Seq(
++            template=template,
++            model=kwargs.get("model", None),
++            pad_to_multiple_of=kwargs.get("pad_to_multiple_of", 8),  # still used by base collator internally
++            label_pad_token_id=IGNORE_INDEX if ignore_pad_token_for_loss else tokenizer.pad_token_id,
++            **tokenizer_module,
++        )
++
++        # Wrap with pack converter
++        self.data_collator = PackedCollatorWrapper(base_collator, tokenizer)
++
++        # No pad_to_multiple_of check for pack format (no padding in final output)
++
++    def __call__(self, *args, **kwargs):
++        return self.data_collator(*args, **kwargs)
++
++
+ class DataCollatorForLLMPretrain:
+     def __init__(self, dataset_param=None, **kwargs):
+         if dataset_param is None:
+@@ -46,5 +74,6 @@ class DataCollatorForLLMPretrain:
+ 
+ DATA_COLLATOR = {
+     "qwen3vl": DataCollatorForQwen2vl,
++    "qwen3vl_packed": DataCollatorForQwen2vlPacked,
+     "llm_pretrain": DataCollatorForLLMPretrain,
+ }
+\ No newline at end of file
+diff --git a/mindspeed_mm/fsdp/data/dataloader/packed_collator_wrapper.py b/mindspeed_mm/fsdp/data/dataloader/packed_collator_wrapper.py
+new file mode 100644
+index 00000000..c886dd6f
+--- /dev/null
++++ b/mindspeed_mm/fsdp/data/dataloader/packed_collator_wrapper.py
+@@ -0,0 +1,133 @@
++"""Packed format collator wrapper for MindSpeed audio training.
++
++Wraps MultiModalDataCollatorForSeq2Seq to convert padded batches to pack format,
++eliminating padding waste. The wrapper:
++  1. Calls the base collator (pad format output)
++  2. Strips padding tokens
++  3. Concatenates samples into a single sequence
++  4. Generates cu_seqlens (cumulative lengths) and position_ids (per-sample restarts)
++"""
++
++import torch
++from typing import Dict, List, Any
++
++
++class PackedCollatorWrapper:
++    """Wrapper that converts pad-format collator output to pack format."""
++
++    def __init__(self, base_collator, tokenizer):
++        """
++        Args:
++            base_collator: Original MultiModalDataCollatorForSeq2Seq instance
++            tokenizer: Tokenizer with pad_token_id
++        """
++        self.base_collator = base_collator
++        self.pad_token_id = tokenizer.pad_token_id
++
++    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
++        """Convert features to pack format.
++
++        Args:
++            features: List of dicts with input_ids, labels, images, audios, etc.
++
++        Returns:
++            Pack format batch:
++              - input_ids: (total_len,) concatenated sequence
++              - position_ids: (total_len,) per-sample position counters
++              - cu_seqlens: (batch_size+1,) cumulative lengths [0, len1, len1+len2, ...]
++              - labels: (total_len,) concatenated
++              - input_features: audio features (unchanged from base collator)
++              - feature_attention_mask: audio attention mask (unchanged)
++        """
++        # Step 1: Get pad-format batch from base collator
++        padded_batch = self.base_collator(features)
++
++        # Step 2: Convert to pack format
++        return self._pad_to_pack(padded_batch)
++
++    def _pad_to_pack(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
++        """Convert padded batch to pack format.
++
++        Note on position_ids shape:
++          The base collator (MultiModalDataCollatorForSeq2Seq) emits position_ids of
++          shape (3, batch_size, seq_len) for Qwen3.5/qwen3_omni MRoPE — three axes for
++          Time/Height/Width. The collator validation in collator.py:220-222 enforces
++          dim()==3. For audio-only training (no images/videos), all three axes hold
++          identical position values, but the 3D shape contract still applies.
++        """
++        input_ids = batch["input_ids"]                 # (batch_size, max_len)
++        labels = batch.get("labels")                   # (batch_size, max_len) or None
++        position_ids = batch.get("position_ids")       # (3, batch_size, max_len) for MRoPE
++
++        batch_size, max_len = input_ids.shape
++        device = input_ids.device
++
++        # Find actual lengths (before padding) for each sample
++        if self.pad_token_id is not None:
++            non_pad_mask = input_ids != self.pad_token_id
++            sample_lens = non_pad_mask.long().sum(dim=1)  # (batch_size,)
++        else:
++            sample_lens = torch.full((batch_size,), max_len, device=device, dtype=torch.long)
++
++        # Validate position_ids shape (must be 3D for MRoPE Qwen3.5 family)
++        is_mrope_3d = position_ids is not None and position_ids.dim() == 3
++        if position_ids is not None and not is_mrope_3d:
++            # Treat 2D as fallback (e.g. non-MRoPE models): expand to 3D so we have one code path.
++            if position_ids.dim() == 2:
++                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).contiguous()
++                is_mrope_3d = True
++
++        # Pack sequences: strip padding, concatenate, restart position_ids per sample.
++        packed_input_ids = []
++        packed_labels = []
++        # For MRoPE we accumulate per-axis position lists separately and cat at the end.
++        packed_pos_per_axis = [[], [], []]
++        cu_seqlens = [0]
++
++        for i in range(batch_size):
++            seq_len = sample_lens[i].item()
++            if seq_len == 0:
++                continue  # Skip empty (shouldn't happen)
++
++            packed_input_ids.append(input_ids[i, :seq_len])
++            if labels is not None:
++                packed_labels.append(labels[i, :seq_len])
++
++            # Per-sample position_ids restarting at 0 — REQUIRED for transformers to
++            # detect packing via _is_packed_sequence and route to FA2 varlen.
++            # We override base collator's monotonically-increasing positions because
++            # those don't reset across samples and FA2 won't recognize boundaries.
++            sample_positions = torch.arange(seq_len, device=device, dtype=torch.long)
++            for ax in range(3):
++                packed_pos_per_axis[ax].append(sample_positions)
++
++            cu_seqlens.append(cu_seqlens[-1] + seq_len)
++
++        # Stack: input_ids/labels get leading batch dim (1, total_len) so framework
++        # loss_func operates on dim=1 as it expects for 2D labels.
++        # position_ids gets shape (3, 1, total_len) per MRoPE 3D contract.
++        packed_input_ids_t = torch.cat(packed_input_ids, dim=0).unsqueeze(0)         # (1, total_len)
++        per_axis_concat = [torch.cat(packed_pos_per_axis[ax], dim=0) for ax in range(3)]
++        position_ids_3d = torch.stack(per_axis_concat, dim=0).unsqueeze(1)            # (3, 1, total_len)
++
++        result = {
++            "input_ids": packed_input_ids_t,
++            "position_ids": position_ids_3d,
++            "cu_seqlens": torch.tensor(cu_seqlens, device=device, dtype=torch.long),  # (batch_size+1,)
++        }
++
++        if labels is not None and packed_labels:
++            result["labels"] = torch.cat(packed_labels, dim=0).unsqueeze(0)            # (1, total_len)
++
++        # Copy over audio-related fields unchanged (already in correct format from base collator)
++        for key in ["input_features", "feature_attention_mask"]:
++            if key in batch:
++                result[key] = batch[key]
++
++        # Copy over any other fields that don't need packing conversion
++        for key in batch:
++            if key not in result and key not in ["input_ids", "labels", "position_ids", "attention_mask"]:
++                # Skip attention_mask for pack format (must be None to trigger FA2 varlen)
++                result[key] = batch[key]
++
++        return result
+diff --git a/mindspeed_mm/fsdp/models/qwen3_5_audio/modeling_qwen3_5_audio.py b/mindspeed_mm/fsdp/models/qwen3_5_audio/modeling_qwen3_5_audio.py
+index 1416d2ba..9144eee4 100644
+--- a/mindspeed_mm/fsdp/models/qwen3_5_audio/modeling_qwen3_5_audio.py
++++ b/mindspeed_mm/fsdp/models/qwen3_5_audio/modeling_qwen3_5_audio.py
+@@ -169,29 +169,66 @@ class Qwen3_5AudioForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
+         video_grid_thw: torch.LongTensor = None,
+         cache_position: torch.LongTensor = None,
+         logits_to_keep=0,
++        cu_seqlens: torch.LongTensor = None,  # Pack format: cumulative sequence lengths
+         **kwargs,
+     ):
++        """Forward supporting both Pack and Pad formats.
++
++        Pack format (when cu_seqlens is provided):
++          - input_ids: (1, total_len) — packed sequence with leading batch dim (set by collator)
++          - position_ids: (1, total_len) — per-sample independent position IDs (reset per sample)
++          - labels: (1, total_len) — packed labels with leading batch dim
++          - cu_seqlens: (batch_size+1,) — cumulative lengths [0, len1, len1+len2, ...]
++          - attention_mask: None (triggers native FA2 varlen path via position_ids resets)
++
++        Pad format (legacy, when cu_seqlens is None):
++          - input_ids: (batch_size, max_len) padded
++          - attention_mask: (batch_size, max_len)
++          - position_ids: auto-generated or provided
++        """
++        # Detect pack vs pad format
++        is_packed = cu_seqlens is not None
++
++        # Pack format: enforce attention_mask=None so transformers routes to FA2 varlen
++        # via position_ids (the _is_packed_sequence detection in modeling_flash_attention_utils).
++        if is_packed:
++            attention_mask = None
++
+         # 先取文本 embedding，再把音频特征 scatter 进 <|audio_pad|> 位置。
+         if inputs_embeds is None:
+             inputs_embeds = self.get_input_embeddings()(input_ids)
++            # Shape after embed:
++            #   pack: (1, total_len, hidden)   — collator already added batch dim
++            #   pad:  (batch, seq_len, hidden) — original 2D input_ids -> 3D embeds
+ 
+         if input_features is not None:
+             audio_embeds = self._get_audio_features(input_features, feature_attention_mask)
+             audio_embeds = audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+ 
+-            audio_mask = (input_ids == self.audio_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+-            n_audio_pos = audio_mask[..., 0].sum()
+-            if n_audio_pos != audio_embeds.shape[0]:
+-                raise ValueError(
+-                    f"音频 token 数不匹配：input_ids 中 <|audio_pad|> 有 {n_audio_pos} 个，"
+-                    f"但 projector 产出 {audio_embeds.shape[0]} 个向量。请检查下采样公式一致性。"
++            if is_packed:
++                # Pack format: replace audio tokens sample-by-sample using cu_seqlens boundaries.
++                # Both input_ids and inputs_embeds carry leading batch dim of size 1.
++                inputs_embeds = self._replace_audio_tokens_packed(
++                    inputs_embeds, audio_embeds, input_ids, cu_seqlens
++                )
++            else:
++                # Pad format: original masked_scatter logic
++                audio_mask = (input_ids == self.audio_token_id).unsqueeze(-1).expand_as(inputs_embeds)
++                n_audio_pos = audio_mask[..., 0].sum()
++                if n_audio_pos != audio_embeds.shape[0]:
++                    raise ValueError(
++                        f"音频 token 数不匹配：input_ids 中 <|audio_pad|> 有 {n_audio_pos} 个，"
++                        f"但 projector 产出 {audio_embeds.shape[0]} 个向量。请检查下采样公式一致性。"
++                    )
++                inputs_embeds = inputs_embeds.masked_scatter(
++                    audio_mask.to(inputs_embeds.device), audio_embeds
+                 )
+-            inputs_embeds = inputs_embeds.masked_scatter(
+-                audio_mask.to(inputs_embeds.device), audio_embeds
+-            )
+ 
+         # 委托父类：input_ids 置 None（与 inputs_embeds 互斥），保留全部 loss 逻辑。
+         # 不传 pixel_values/grid_thw，即关闭视觉分支。
++        # Pack format reaches here with shapes:
++        #   inputs_embeds: (1, total_len, hidden), position_ids/labels: (1, total_len),
++        #   attention_mask: None — triggers FA2 varlen via position_ids resets.
+         return super().forward(
+             input_ids=None,
+             attention_mask=attention_mask,
+@@ -203,3 +240,46 @@ class Qwen3_5AudioForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
+             logits_to_keep=logits_to_keep,
+             **kwargs,
+         )
++
++    def _replace_audio_tokens_packed(
++        self,
++        inputs_embeds: torch.Tensor,  # (1, total_len, hidden)
++        audio_embeds: torch.Tensor,   # (total_audio_tokens, hidden)
++        input_ids: torch.Tensor,      # (1, total_len)
++        cu_seqlens: torch.Tensor,     # (batch_size+1,)
++    ) -> torch.Tensor:
++        """Replace audio tokens in pack format, sample by sample via cu_seqlens.
++
++        Operates on tensors that carry a leading batch dim of size 1 (set by collator),
++        which the framework expects throughout. We index via [0, start:end] so the
++        output retains the batch dim for downstream FSDP/loss handling.
++        """
++        batch_size = len(cu_seqlens) - 1
++        audio_offset = 0
++
++        for b in range(batch_size):
++            start = cu_seqlens[b].item()
++            end = cu_seqlens[b + 1].item()
++            sample_ids = input_ids[0, start:end]               # (sample_len,)
++            sample_embeds = inputs_embeds[0, start:end]        # (sample_len, hidden)
++
++            audio_positions = (sample_ids == self.audio_token_id).nonzero(as_tuple=True)[0]
++            n_audio = len(audio_positions)
++
++            if n_audio > 0:
++                sample_audio = audio_embeds[audio_offset : audio_offset + n_audio]
++                if sample_audio.shape[0] != n_audio:
++                    raise ValueError(
++                        f"Sample {b}: audio token count mismatch. "
++                        f"input_ids has {n_audio} <|audio_pad|>, but audio_embeds provides {sample_audio.shape[0]}."
++                    )
++                sample_embeds[audio_positions] = sample_audio
++                inputs_embeds[0, start:end] = sample_embeds
++                audio_offset += n_audio
++
++        if audio_offset != audio_embeds.shape[0]:
++            raise ValueError(
++                f"Total audio token mismatch: processed {audio_offset}, but audio_embeds has {audio_embeds.shape[0]}."
++            )
++
++        return inputs_embeds
