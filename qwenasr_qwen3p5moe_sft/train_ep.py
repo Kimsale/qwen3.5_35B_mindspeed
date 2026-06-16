@@ -1020,6 +1020,7 @@ def main():
     parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha scaling")
     parser.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA dropout")
     parser.add_argument("--use_packed_format", action="store_true", help="Use packed sequence format (eliminates padding waste, requires FA2)")
+    parser.add_argument("--max_steps", type=int, default=0, help="If >0, stop after this many optimizer steps (for smoke tests / profiling)")
     args = parser.parse_args()
 
     # Setup distributed
@@ -1569,6 +1570,12 @@ def main():
                     if rank == 0:
                         logger.info(f"Checkpoint saved at step {global_step}")
 
+                # Early stop for smoke tests / profiling
+                if args.max_steps > 0 and global_step >= args.max_steps:
+                    if rank == 0:
+                        logger.info(f"Reached max_steps={args.max_steps}, stopping early.")
+                    break
+
             # [PROF] record end-of-batch timestamp for next data timing
             if rank == 0:
                 torch.npu.synchronize() if hasattr(torch, 'npu') else None
@@ -1577,6 +1584,10 @@ def main():
         epoch_time = time.time() - epoch_start
         if rank == 0:
             logger.info(f"Epoch {epoch+1} completed in {epoch_time:.1f}s")
+
+        # Early stop for smoke tests / profiling (break outer epoch loop too)
+        if args.max_steps > 0 and global_step >= args.max_steps:
+            break
 
     # Final save
     save_ep_checkpoint(

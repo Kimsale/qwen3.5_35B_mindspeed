@@ -40,3 +40,9 @@ qwenasr_qwen3p5moe_sft/lmdbdata/lmdb/
 qwenasr_qwen3p5moe_sft/lmdbdata/res/
 qwenasr_qwen3p5moe_sft/lmdbdata/pasre_lmdb_code/wavs/
 qwenasr_qwen3p5moe_sft/**/__pycache__/
+qwenasr_qwen3p5moe_sft/lmdbdata/pasre_lmdb_code/ce_label/
+qwenasr_qwen3p5moe_sft/lmdbdata/pasre_lmdb_code/ed_label/
+qwenasr_qwen3p5moe_sft/lmdbdata/pasre_lmdb_code/ed_label_kws/
+qwenasr_qwen3p5moe_sft/lmdbdata/pasre_lmdb_code/ed_label_src/
+qwenasr_qwen3p5moe_sft/lmdbdata/pasre_lmdb_code/lengths/
+qwenasr_qwen3p5moe_sft/output_*/
