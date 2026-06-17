@@ -21,6 +21,7 @@ Qwen3.5-35B-A3B（linear+full 混合注意力 MoE 文本塔）上，做"语音 w
 完整尝试记录和日志索引见：
 
 - [`legacy_zero2_migration_report.md`](/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/legacy_zero2_migration_report.md)
+- [`HANDOFF_BRIEF.md`](/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/HANDOFF_BRIEF.md)
 
 ---
 
