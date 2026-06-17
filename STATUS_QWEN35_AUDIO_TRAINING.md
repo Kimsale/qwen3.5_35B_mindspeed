@@ -151,6 +151,13 @@ parallel:
 | Pack mbs>1 hang | FSDP2 lazy init 时跨 rank 序列长度不一致 | 无法提升 mbs | Collator 加全局长度对齐 |
 | MC2 audio EP8 未实测 | 时间优先给了 pack 验证 | MC2 收益未量化 | Priority 1/3 实测 |
 | mbs=2 (pad) 外部 SIGTERM | 环境级问题，23 次调参均无效 | Pad 格式无法提升 mbs | 成本高，暂不继续 |
+| **Legacy ZeRO2 迁移失败** | ParamAndGradBuffer OOM, meta tensor 残留 | 无法替代 FSDP2 | 已放弃（tag: v-legacy-zero2-failed） |
+
+> **Legacy ZeRO2 尝试**: 在 MindSpeed-MM 源码仓库的 `feat/llm-pad-to-pack-legacy-zero2` 分支
+> 尝试将 pack 从 FSDP2 切换到 legacy ZeRO2 + custom_fsdp，解决了 meta init/LoRA/Whisper 加载问题，
+> 但最终在 ParamAndGradBuffer 初始化时 OOM，optimizer 仍有 meta tensor 残留，未能进入首个 iteration。
+> **结论**: 投入产出比低，放弃迁移，继续使用 pack + FSDP2 mbs=1 (WPS 2111)。
+> 详见 [tag v-legacy-zero2-failed](https://github.com/Kimsale/qwen3.5_35B_mindspeed/releases/tag/v-legacy-zero2-failed)
 
 ---
 
@@ -168,161 +175,14 @@ parallel:
 
 ---
 
+
+### 失败尝试（已归档）
+- `feat/llm-pad-to-pack-legacy-zero2`: Legacy ZeRO2 迁移（ParamAndGradBuffer OOM，已放弃）
+  - 位置: MindSpeed-MM 源码仓库 `/data/sejin/third_party/mindspeed-mm-26.0.0`
+  - Tag: [v-legacy-zero2-failed](https://github.com/Kimsale/qwen3.5_35B_mindspeed/releases/tag/v-legacy-zero2-failed)
+  - 文档: `examples/qwen3_5_audio/HANDOFF_BRIEF.md`, `legacy_zero2_migration_report.md`
+
+---
+
 **最后更新**: 2026-06-17  
 **下次同步**: Pack + MC2 组合验证完成后
-
-**选择一个数据来源**：
-
-**选项 A：使用演示数据（快速测试）**
-```bash
-cd /data/sejin/baseline_26/scripts
-python3 prepare_audio_data.py --mode demo --output /data/sejin/baseline_26/data_audio --num-samples 10
-```
-然后手动准备 10 个 .wav 文件到 `data_audio/audio/` 目录，或修改 JSONL 中的路径指向你的真实音频文件。
-
-**选项 B：转换现有数据集**
-```bash
-# 如果你有 CSV 格式数据（audio_path, transcription）
-python3 prepare_audio_data.py --mode csv \
-    --input your_data.csv \
-    --output /data/sejin/baseline_26/data_audio/train.jsonl \
-    --audio-dir /path/to/audio/files
-
-# 如果你有目录格式（音频在一个目录，转写在文本文件）
-python3 prepare_audio_data.py --mode dir \
-    --audio-dir /path/to/audio/files \
-    --transcription-file transcriptions.txt \
-    --output /data/sejin/baseline_26/data_audio/train.jsonl
-```
-
-**选项 C：直接编写 JSONL**
-
-按照以下格式手动创建 `/data/sejin/baseline_26/data_audio/train.jsonl`：
-```jsonl
-{"id": "sample_001", "audios": ["/path/to/audio1.wav"], "messages": [{"role": "user", "content": "<|AUDIO|>\n请转写这段语音。"}, {"role": "assistant", "content": "今天天气很好。"}]}
-{"id": "sample_002", "audios": ["/path/to/audio2.wav"], "messages": [{"role": "user", "content": "<|AUDIO|>\n这段音频说了什么？"}, {"role": "assistant", "content": "会议定于下周三召开。"}]}
-```
-
-**验证数据**：
-```bash
-python3 prepare_audio_data.py --mode validate --input /data/sejin/baseline_26/data_audio/train.jsonl
-```
-
----
-
-### 🚀 Step 2：小规模测试（10步）
-
-数据准备完成后，先跑 10 步验证配置：
-
-```bash
-# 1. 修改配置为小规模测试
-cd /data/sejin/baseline_26/scripts
-# 编辑 train_qwen35_audio.yaml，改 max_steps: 10, save_interval: 5
-
-# 2. 启动训练
-chmod +x train_qwen35_audio.sh
-./train_qwen35_audio.sh
-
-# 3. 监控日志
-tail -f /data/sejin/baseline_26/logs/qwen35_audio_*.log
-```
-
-**关键检查点**：
-- [ ] 训练成功启动（无模型加载错误）
-- [ ] 音频数据正常加载（无路径错误）
-- [ ] 首步完成（无 OOM、无崩溃）
-- [ ] Loss 正常（首步约 2-5，后续下降）
-- [ ] HBM 占用合理（55-62GB，与之前接近）
-- [ ] 单步耗时合理（2-5s）
-
----
-
-### 📊 Step 3：完整训练（500步）
-
-测试通过后，恢复完整配置并重新训练：
-
-```bash
-# 1. 恢复配置
-# 编辑 train_qwen35_audio.yaml，改回 max_steps: 500, save_interval: 100
-
-# 2. 重新启动训练
-./train_qwen35_audio.sh
-
-# 3. 等待训练完成（预计 20-40 分钟）
-```
-
-**预期产出**：
-- Checkpoint: `/data/sejin/baseline_26/output/qwen35_audio_ckpt/checkpoint-{100,200,300,400,500}/`
-- LoRA adapter: `checkpoint-500/lora_adapter_model.safetensors` (~44MB)
-- 日志: `/data/sejin/baseline_26/logs/qwen35_audio_*.log`
-
----
-
-### ✅ Step 4：验证效果
-
-训练完成后，用 LoRA adapter 进行推理验证效果。
-
----
-
-## 五、关键文件速查
-
-```bash
-# 配置文件
-/data/sejin/baseline_26/scripts/train_qwen35_audio.yaml      # 训练配置
-/data/sejin/baseline_26/scripts/train_qwen35_audio.sh        # 启动脚本
-/data/sejin/baseline_26/scripts/prepare_audio_data.py        # 数据准备工具
-
-# 文档
-/data/sejin/baseline_26/QWEN35_AUDIO_TRAINING_GUIDE.md       # 详细指南
-
-# 模型
-/mnt/shared_data_196/sejin/models/Qwen3.5-35B-A3B-audio-dcp  # LLM 权重
-/mnt/shared_data_196/sejin/models/whisper-large-v3           # Whisper 权重
-
-# 数据（需你准备）
-/data/sejin/baseline_26/data_audio/train.jsonl               # 训练数据
-/data/sejin/baseline_26/data_audio/val.jsonl                 # 验证数据（可选）
-
-# 输出
-/data/sejin/baseline_26/output/qwen35_audio_ckpt/            # Checkpoint
-/data/sejin/baseline_26/logs/qwen35_audio_*.log              # 训练日志
-
-# 环境
-/data/sejin/env/venv_qwen35                                   # Python 环境
-```
-
----
-
-## 六、常见问题速查
-
-| 问题 | 解决方案 |
-|---|---|
-| 数据路径错误 | 检查 JSONL 中 `audios` 字段的路径是否正确 |
-| OOM（显存不足） | 降低 `max_seq_length` (2048→1024) 或启用 `activation_offload` |
-| 音频格式不支持 | 转换为 16kHz .wav: `ffmpeg -i input.mp3 -ar 16000 output.wav` |
-| 模型加载失败 | 确认 `model_path` 指向 **audio-dcp** 版本 |
-| 单步过慢 | 正常现象（Triton 编译），后续会加速 |
-
----
-
-## 七、性能预期（基于历史经验）
-
-| 指标 | 预期值 | 备注 |
-|---|---|---|
-| 单步耗时 | 2-5s | 音频预处理比纯文本略慢 |
-| HBM 占用 | 55-62GB/64GB | 与纯文本训练接近（audio_tower 冻结） |
-| Loss 初始值 | 2-5 | 取决于任务类型 |
-| Loss 收敛 | 0.5-1.5 | 500步后 |
-| 训练总时长 | 20-40 分钟 | 500步，单步约 2-5s |
-
----
-
-## 八、联系与参考
-
-- **详细指南**：`/data/sejin/baseline_26/QWEN35_AUDIO_TRAINING_GUIDE.md`
-- **官方示例**：`/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/`
-- **历史报告**：`/data/sejin/baseline_26/reports/qwen35_35B_lora_60step_perf_report.md`
-
----
-
-**总结**：所有配置和脚本已就绪，只需准备音频数据即可立即开始训练。数据准备是唯一的阻塞项，完成后即可启动。
