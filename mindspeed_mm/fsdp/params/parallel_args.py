@@ -47,7 +47,10 @@ class TPPlanConfig:
 class EPPlanConfig:
     """Configuration for Expert Parallelism (EP) plan for MoE models."""
     apply_modules: List[str] = field(default_factory=list)
-    dispatcher: Literal["eager", "fused", "mc2"] = "fused"
+    dispatcher: Literal["eager", "fused", "mc2", "pipeline"] = "fused"
+    pipeline_chunks: int = 1
+    pipeline_multi_stream: bool = True
+    pipeline_min_tokens_per_chunk: int = 0
     apply_efsdp_modules: List[str] = field(default_factory=list)
     _gradient_divide_factor: float = None
 

@@ -1,6 +1,7 @@
 import os
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
@@ -22,6 +23,8 @@ _MOE_PHASE_STATE = {
     "last_input_splits": None,
     "last_output_splits": None,
 }
+_ASYNC_A2A_HANDLES: List[object] = []
+_PIPELINE_COMM_STREAM = None
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -75,6 +78,12 @@ class _MoePhaseProfiler:
         self.phase_ms[name] = self.phase_ms.get(name, 0.0) + (now - self._last) * 1000.0
         self._last = now
 
+    def add_elapsed(self, name: str, start_time: float):
+        if not self.enabled:
+            return
+        _phase_sync(self.sync)
+        self.phase_ms[name] = self.phase_ms.get(name, 0.0) + (time.perf_counter() - start_time) * 1000.0
+
     def finish(
         self,
         input_splits: List,
@@ -123,6 +132,10 @@ class _MoePhaseProfiler:
                 "permute_pre_a2a",
                 "alltoall_dispatch",
                 "permute_post_a2a",
+                "pipeline_wait_dispatch",
+                "pipeline_compute",
+                "pipeline_start_combine",
+                "pipeline_wait_combine",
                 "gmm_fc1",
                 "swiglu",
                 "gmm_fc2",
@@ -168,6 +181,233 @@ def all_to_all(
     return _all_to_all(process_group, input_, gather_sizes, scatter_sizes)
 
 
+class _AsyncAllToAll(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, group, inputs, output_split_sizes, input_split_sizes, async_op):
+        ctx.group = group
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+
+        world_size = dist.get_world_size(group=group)
+        if world_size == 1:
+            return inputs
+
+        inputs = inputs.contiguous()
+        output = inputs.new_empty(size=[sum(output_split_sizes)] + list(inputs.size()[1:]))
+        handle = dist.all_to_all_single(
+            output,
+            inputs,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+            async_op=async_op,
+        )
+        if async_op:
+            _ASYNC_A2A_HANDLES.append(handle)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = _all_to_all(ctx.group, grad_output.contiguous(), ctx.input_split_sizes, ctx.output_split_sizes)
+        return None, grad_input, None, None, None
+
+
+@dataclass
+class _AsyncA2AWork:
+    tensor: torch.Tensor
+    input_tensor: Optional[torch.Tensor] = None
+    handle: Optional[object] = None
+    stream: Optional[object] = None
+
+    def wait(self):
+        if self.handle is not None:
+            self.handle.wait()
+        if self.stream is not None and hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.current_stream().wait_stream(self.stream)
+        return self.tensor
+
+
+@dataclass
+class _PipelineChunkSpec:
+    start: int
+    end: int
+    send_counts: List[int]
+    recv_counts: List[int]
+    local_expert_counts: torch.Tensor
+
+
+def _get_pipeline_comm_stream():
+    global _PIPELINE_COMM_STREAM
+    if _PIPELINE_COMM_STREAM is None:
+        _PIPELINE_COMM_STREAM = torch.npu.Stream(device=torch.npu.current_device())
+    return _PIPELINE_COMM_STREAM
+
+
+def _pop_async_a2a_handle() -> Optional[object]:
+    if not _ASYNC_A2A_HANDLES:
+        return None
+    return _ASYNC_A2A_HANDLES.pop()
+
+
+def _record_stream(tensor: torch.Tensor, stream):
+    if stream is not None and hasattr(tensor, "record_stream"):
+        tensor.record_stream(stream)
+
+
+def _start_all_to_all(
+    input_: torch.Tensor,
+    process_group: dist.ProcessGroup,
+    scatter_sizes: List[int],
+    gather_sizes: List[int],
+    multi_stream: bool = True,
+) -> _AsyncA2AWork:
+    world_size = dist.get_world_size(group=process_group)
+    if world_size == 1:
+        return _AsyncA2AWork(input_, input_tensor=input_)
+
+    input_ = input_.contiguous()
+    use_stream = multi_stream and hasattr(torch, "npu") and torch.npu.is_available()
+    if use_stream:
+        stream = _get_pipeline_comm_stream()
+        stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(stream):
+            output = _AsyncAllToAll.apply(process_group, input_, gather_sizes, scatter_sizes, True)
+        _record_stream(input_, stream)
+        _record_stream(output, stream)
+        return _AsyncA2AWork(output, input_tensor=input_, handle=_pop_async_a2a_handle(), stream=stream)
+
+    output = _AsyncAllToAll.apply(process_group, input_, gather_sizes, scatter_sizes, True)
+    return _AsyncA2AWork(output, input_tensor=input_, handle=_pop_async_a2a_handle(), stream=None)
+
+
+def _build_pipeline_ranges(
+    num_global_tokens_per_expert: torch.Tensor,
+    ep_size: int,
+    num_local_experts: int,
+    pipeline_chunks: int,
+    min_tokens_per_chunk: int,
+):
+    num_chunks = max(1, min(int(pipeline_chunks), num_local_experts))
+    chunk_size = (num_local_experts + num_chunks - 1) // num_chunks
+    ranges = [
+        (start, min(start + chunk_size, num_local_experts))
+        for start in range(0, num_local_experts, chunk_size)
+    ]
+    if min_tokens_per_chunk <= 0 or len(ranges) <= 1:
+        return ranges
+
+    merged_ranges = []
+    current_start = None
+    current_end = None
+    current_tokens = 0
+    for start, end in ranges:
+        if current_start is None:
+            current_start = start
+        current_end = end
+        for target_rank in range(ep_size):
+            global_start = target_rank * num_local_experts + start
+            global_end = target_rank * num_local_experts + end
+            current_tokens += int(num_global_tokens_per_expert[:, global_start:global_end].sum().item())
+        if current_tokens >= min_tokens_per_chunk:
+            merged_ranges.append((current_start, current_end))
+            current_start = None
+            current_end = None
+            current_tokens = 0
+    if current_start is not None:
+        if merged_ranges:
+            prev_start, _ = merged_ranges.pop()
+            merged_ranges.append((prev_start, current_end))
+        else:
+            merged_ranges.append((current_start, current_end))
+    return merged_ranges
+
+
+def _build_pipeline_specs(
+    num_global_tokens_per_expert: torch.Tensor,
+    ep_rank: int,
+    ep_size: int,
+    num_local_experts: int,
+    pipeline_chunks: int,
+    min_tokens_per_chunk: int,
+) -> List[_PipelineChunkSpec]:
+    local_counts = num_global_tokens_per_expert[ep_rank]
+    specs = []
+    for start, end in _build_pipeline_ranges(
+        num_global_tokens_per_expert,
+        ep_size,
+        num_local_experts,
+        pipeline_chunks,
+        min_tokens_per_chunk,
+    ):
+        send_counts = []
+        for target_rank in range(ep_size):
+            global_start = target_rank * num_local_experts + start
+            global_end = target_rank * num_local_experts + end
+            send_counts.append(int(local_counts[global_start:global_end].sum().item()))
+
+        local_start = ep_rank * num_local_experts + start
+        local_end = ep_rank * num_local_experts + end
+        recv_counts = [
+            int(num_global_tokens_per_expert[source_rank, local_start:local_end].sum().item())
+            for source_rank in range(ep_size)
+        ]
+        local_expert_counts = num_global_tokens_per_expert[:, local_start:local_end].sum(dim=0).contiguous()
+        specs.append(_PipelineChunkSpec(start, end, send_counts, recv_counts, local_expert_counts))
+    return specs
+
+
+def _expert_offsets(counts: torch.Tensor) -> List[int]:
+    offsets = [0]
+    offsets.extend(torch.cumsum(counts, dim=0).tolist())
+    return [int(value) for value in offsets]
+
+
+def _slice_pipeline_dispatch_input(
+    permuted_hidden_states: torch.Tensor,
+    local_expert_offsets: List[int],
+    spec: _PipelineChunkSpec,
+    ep_size: int,
+    num_local_experts: int,
+):
+    pieces = []
+    for target_rank in range(ep_size):
+        global_start = target_rank * num_local_experts + spec.start
+        global_end = target_rank * num_local_experts + spec.end
+        pieces.append(permuted_hidden_states[local_expert_offsets[global_start]:local_expert_offsets[global_end]])
+    if pieces:
+        return torch.cat(pieces, dim=0)
+    return permuted_hidden_states.new_empty((0, permuted_hidden_states.shape[-1]))
+
+
+def _local_expert_indices_for_chunk(
+    spec: _PipelineChunkSpec,
+    num_global_tokens_per_expert: torch.Tensor,
+    ep_rank: int,
+    ep_size: int,
+    num_local_experts: int,
+):
+    local_ids = torch.arange(
+        spec.end - spec.start,
+        dtype=torch.int32,
+        device=num_global_tokens_per_expert.device,
+    )
+    pieces = []
+    local_start = ep_rank * num_local_experts + spec.start
+    local_end = ep_rank * num_local_experts + spec.end
+    for source_rank in range(ep_size):
+        counts = num_global_tokens_per_expert[source_rank, local_start:local_end]
+        pieces.append(torch.repeat_interleave(local_ids, counts))
+    if pieces:
+        return torch.cat(pieces, dim=0)
+    return local_ids.new_empty((0,), dtype=torch.int32)
+
+
+def _empty_expert_output(hidden_states: torch.Tensor, fc1_weight: torch.Tensor, fc2_weight: torch.Tensor):
+    intermediate_hidden_states = hidden_states @ fc1_weight.sum(0)
+    gate_output, down_output = torch.chunk(intermediate_hidden_states, 2, dim=-1)
+    return (gate_output + down_output) @ fc2_weight.sum(0) * 0.
+
+
 def ep_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -177,9 +417,28 @@ def ep_forward(
     fc2_weight: torch.Tensor,
     ep_group: Optional[dist.ProcessGroup] = None,
     fused: bool = True,
+    pipeline_chunks: int = 1,
+    pipeline_multi_stream: bool = True,
+    pipeline_min_tokens_per_chunk: int = 0,
 ) -> torch.Tensor:
     if routing_weights.size() != selected_experts.size():
         routing_weights = routing_weights.gather(1, selected_experts)
+
+    ep_size = 1 if ep_group is None else dist.get_world_size(ep_group)
+    if pipeline_chunks > 1 and ep_size > 1:
+        return ep_forward_pipeline(
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_weight,
+            fc2_weight,
+            ep_group=ep_group,
+            fused=fused,
+            pipeline_chunks=pipeline_chunks,
+            pipeline_multi_stream=pipeline_multi_stream,
+            pipeline_min_tokens_per_chunk=pipeline_min_tokens_per_chunk,
+        )
 
     profiler = _MoePhaseProfiler(fused=fused)
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -234,10 +493,166 @@ def ep_forward(
     return hidden_states
 
 
+def ep_forward_pipeline(
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    ep_group: dist.ProcessGroup,
+    fused: bool = True,
+    pipeline_chunks: int = 2,
+    pipeline_multi_stream: bool = True,
+    pipeline_min_tokens_per_chunk: int = 0,
+) -> torch.Tensor:
+    profiler = _MoePhaseProfiler(fused=fused)
+    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    (
+        input_splits,
+        output_splits,
+        num_global_tokens_per_local_expert,
+        num_global_sum_tokens_per_local_expert,
+        num_global_tokens_per_expert,
+    ) = dispatch_preprocess(selected_experts, num_experts, ep_group, return_global_tokens=True)
+    profiler.mark("dispatch_preprocess")
+
+    ep_size = dist.get_world_size(ep_group)
+    ep_rank = dist.get_rank(ep_group)
+    if num_experts % ep_size != 0:
+        raise ValueError(f"Number of experts ({num_experts}) must be divisible by expert parallel size ({ep_size}).")
+    num_local_experts = num_experts // ep_size
+
+    permuted_hidden_states, unpermute_indices = permute(hidden_states, selected_experts.to(torch.int32), fused=fused)
+    profiler.mark("permute_pre_a2a")
+    local_expert_offsets = _expert_offsets(num_global_tokens_per_expert[ep_rank])
+    specs = _build_pipeline_specs(
+        num_global_tokens_per_expert,
+        ep_rank,
+        ep_size,
+        num_local_experts,
+        pipeline_chunks,
+        pipeline_min_tokens_per_chunk,
+    )
+
+    rank_parts: List[List[torch.Tensor]] = [[] for _ in range(ep_size)]
+    dispatch_work = None
+    combine_work = None
+    combine_spec = None
+
+    def start_dispatch(spec: _PipelineChunkSpec):
+        chunk_input = _slice_pipeline_dispatch_input(
+            permuted_hidden_states,
+            local_expert_offsets,
+            spec,
+            ep_size,
+            num_local_experts,
+        )
+        return _start_all_to_all(
+            chunk_input,
+            ep_group,
+            scatter_sizes=spec.send_counts,
+            gather_sizes=spec.recv_counts,
+            multi_stream=pipeline_multi_stream,
+        )
+
+    def finish_combine(work: _AsyncA2AWork, spec: _PipelineChunkSpec):
+        combined = work.wait()
+        profiler.mark("pipeline_wait_combine")
+        for rank, part in enumerate(torch.split(combined, spec.send_counts, dim=0)):
+            rank_parts[rank].append(part)
+
+    if specs:
+        dispatch_work = start_dispatch(specs[0])
+
+    for idx, spec in enumerate(specs):
+        next_dispatch_work = start_dispatch(specs[idx + 1]) if idx + 1 < len(specs) else None
+
+        dispatched_hidden_states = dispatch_work.wait()
+        profiler.mark("pipeline_wait_dispatch")
+        compute_start = time.perf_counter()
+        if dispatched_hidden_states.shape[0] > 0:
+            local_expert_indices = _local_expert_indices_for_chunk(
+                spec,
+                num_global_tokens_per_expert,
+                ep_rank,
+                ep_size,
+                num_local_experts,
+            )
+            dispatched_hidden_states, post_dispatch_unpermute_indices = permute(
+                dispatched_hidden_states,
+                local_expert_indices,
+                fused=fused,
+            )
+            profiler.mark("permute_post_a2a")
+            intermediate_hidden_states = grouped_matmul(
+                dispatched_hidden_states,
+                fc1_weight[spec.start:spec.end],
+                spec.local_expert_counts,
+                fused=fused,
+            )
+            profiler.mark("gmm_fc1")
+            intermediate_activations = swiglu(intermediate_hidden_states, dim=-1, fused=fused)
+            profiler.mark("swiglu")
+            chunk_output = grouped_matmul(
+                intermediate_activations,
+                fc2_weight[spec.start:spec.end],
+                spec.local_expert_counts,
+                fused=fused,
+            )
+            profiler.mark("gmm_fc2")
+            chunk_output = unpermute(chunk_output, post_dispatch_unpermute_indices, fused=fused)
+            profiler.mark("unpermute_pre_combine")
+        else:
+            chunk_output = _empty_expert_output(
+                dispatched_hidden_states,
+                fc1_weight[spec.start:spec.end],
+                fc2_weight[spec.start:spec.end],
+            )
+            profiler.mark("gmm_fc1")
+            profiler.mark("swiglu")
+            profiler.mark("gmm_fc2")
+            profiler.mark("unpermute_pre_combine")
+        profiler.add_elapsed("pipeline_compute", compute_start)
+
+        if combine_work is not None:
+            finish_combine(combine_work, combine_spec)
+
+        current_combine_work = _start_all_to_all(
+            chunk_output,
+            ep_group,
+            scatter_sizes=spec.recv_counts,
+            gather_sizes=spec.send_counts,
+            multi_stream=pipeline_multi_stream,
+        )
+        profiler.mark("pipeline_start_combine")
+
+        dispatch_work = next_dispatch_work
+        combine_work = current_combine_work
+        combine_spec = spec
+
+    if combine_work is not None:
+        finish_combine(combine_work, combine_spec)
+
+    rank_outputs = []
+    for parts in rank_parts:
+        if parts:
+            rank_outputs.append(torch.cat(parts, dim=0))
+    if rank_outputs:
+        hidden_states = torch.cat(rank_outputs, dim=0)
+    else:
+        hidden_states = hidden_states.new_empty((0, hidden_states.shape[-1]))
+    hidden_states = unpermute(hidden_states.to(routing_weights.dtype), unpermute_indices, probs=routing_weights, fused=fused)
+    profiler.mark("unpermute_final")
+    profiler.finish(input_splits, output_splits, num_global_sum_tokens_per_local_expert)
+    return hidden_states
+
+
 def dispatch_preprocess(
     selected_experts: torch.Tensor,
     num_global_experts: int,
     ep_group: Optional[dist.ProcessGroup] = None,
+    return_global_tokens: bool = False,
 ):
     if ep_group is None:
         ep_size = 1
@@ -271,6 +686,14 @@ def dispatch_preprocess(
     output_splits = num_global_tokens_per_local_expert.sum(dim=1).tolist()
 
     num_global_sum_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0)
+    if return_global_tokens:
+        return (
+            input_splits,
+            output_splits,
+            num_global_tokens_per_local_expert,
+            num_global_sum_tokens_per_local_expert,
+            num_global_tokens_per_expert,
+        )
     return input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert
 
 

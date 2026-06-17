@@ -949,7 +949,10 @@ class Qwen3_5MoeExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
         ep_group: ProcessGroup,
-        dispatcher: str = "fused"
+        dispatcher: str = "fused",
+        pipeline_chunks: int = 1,
+        pipeline_multi_stream: bool = True,
+        pipeline_min_tokens_per_chunk: int = 0,
     ) -> torch.Tensor:
         gate_up_proj = self.gate_up_proj.to_local() if isinstance(self.gate_up_proj, DTensor) else self.gate_up_proj
         down_proj = self.down_proj.to_local() if isinstance(self.down_proj, DTensor) else self.down_proj
@@ -980,7 +983,10 @@ class Qwen3_5MoeExperts(nn.Module):
             fc1_weight=gate_up_proj,
             fc2_weight=down_proj,
             ep_group=ep_group,
-            fused=(dispatcher != "eager")
+            fused=(dispatcher != "eager"),
+            pipeline_chunks=pipeline_chunks if dispatcher == "pipeline" else 1,
+            pipeline_multi_stream=pipeline_multi_stream,
+            pipeline_min_tokens_per_chunk=pipeline_min_tokens_per_chunk,
         )
         return hidden_states
 
@@ -2644,7 +2650,6 @@ __all__ = [
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3_5MoePreTrainedModel",
 ]
-
 
 
 

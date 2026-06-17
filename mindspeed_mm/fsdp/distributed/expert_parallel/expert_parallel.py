@@ -30,15 +30,27 @@ def expert_parallelize_modules(modules: torch.nn.Module, ep_mesh: DeviceMesh, pl
 
         # replace forward with ep forward
         if hasattr(module, 'ep_forward') and callable(module.ep_forward):
-            # Forward the configured dispatcher (eager/fused/mc2) so the module's
-            # ep_forward can opt into mc2 comm-compute overlap. Defaults preserve
-            # the previous fused behaviour for modules that ignore the kwarg.
+            # Forward the configured dispatcher so Qwen fused-tensor experts can
+            # opt into mc2 or chunked pipeline execution.
             try:
-                module.forward = partial(module.ep_forward, ep_group=ep_group, dispatcher=plan.dispatcher)
+                module.forward = partial(
+                    module.ep_forward,
+                    ep_group=ep_group,
+                    dispatcher=plan.dispatcher,
+                    pipeline_chunks=getattr(plan, "pipeline_chunks", 1),
+                    pipeline_multi_stream=getattr(plan, "pipeline_multi_stream", True),
+                    pipeline_min_tokens_per_chunk=getattr(plan, "pipeline_min_tokens_per_chunk", 0),
+                )
             except TypeError:
                 module.forward = partial(module.ep_forward, ep_group=ep_group)
         else:
-            experts_forward_fn = get_experts_forward_fn_for_qwen(ep_group, dispatcher=plan.dispatcher)
+            experts_forward_fn = get_experts_forward_fn_for_qwen(
+                ep_group,
+                dispatcher=plan.dispatcher,
+                pipeline_chunks=getattr(plan, "pipeline_chunks", 1),
+                pipeline_multi_stream=getattr(plan, "pipeline_multi_stream", True),
+                pipeline_min_tokens_per_chunk=getattr(plan, "pipeline_min_tokens_per_chunk", 0),
+            )
             module.forward = types.MethodType(experts_forward_fn, module)
 
     return modules
@@ -94,6 +106,8 @@ def get_dispatcher_fn(dispatcher, ep_group):
             forward_fn = get_experts_forward_fn(ep_group, fused=True)
         elif dispatcher == 'mc2':
             forward_fn = get_experts_forward_mc2_fn(ep_group)
+        elif dispatcher == 'pipeline':
+            forward_fn = get_experts_forward_fn(ep_group, fused=True)
 
     if forward_fn is None:
         raise RuntimeError(f'Unsupported dispatcher {dispatcher}.')
@@ -116,7 +130,13 @@ def apply_grad_division_hook(module, ep_size):
             grad_acc.register_hook(get_grad_division_hook(param, ep_size))
 
 
-def get_experts_forward_fn_for_qwen(ep_group, dispatcher="fused"):
+def get_experts_forward_fn_for_qwen(
+    ep_group,
+    dispatcher="fused",
+    pipeline_chunks=1,
+    pipeline_multi_stream=True,
+    pipeline_min_tokens_per_chunk=0,
+):
     from .ep_dispatcher import ep_forward
 
     def experts_forward(self, hidden_states: torch.Tensor, routing_weights: torch.Tensor, router_indices: torch.Tensor):
@@ -135,6 +155,9 @@ def get_experts_forward_fn_for_qwen(ep_group, dispatcher="fused"):
             fc2_weight=down_proj,
             ep_group=ep_group,
             fused=fused,
+            pipeline_chunks=pipeline_chunks if dispatcher == "pipeline" else 1,
+            pipeline_multi_stream=pipeline_multi_stream,
+            pipeline_min_tokens_per_chunk=pipeline_min_tokens_per_chunk,
         )
         hidden_states = hidden_states.view(batch_size, -1, self.hidden_size)
         return hidden_states
