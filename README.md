@@ -4,6 +4,10 @@
 **环境**: 单机 8 卡 Ascend 910B3, CANN 8.5.0, MindSpeed-MM 26.0.0  
 **约束**: 不改模型结构/MoE 路由/专家数量; LoRA-only; 数学一致; HBM 55-60G
 
+**本分支成果（mc2-perf-eval）**: Pad 格式 38 轮配置扫描，EP8 最优稳定配置 **pad1536_nosync
+（WPS 1133，HBM 56.4GB）**；MC2 通信-计算重叠代码已接通（`dispatcher: mc2`），预期 WPS +10-15%，
+**待音频 EP8 实测验证**。详见 [`reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md`](reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md)。
+
 ---
 
 ## 一、仓库结构
@@ -239,25 +243,56 @@ export HCCL_DETERMINISTIC=1
 
 ## 七、性能指标参考
 
-### 基线配置（EP8, mbs=1, ga=4, rc_off, pad1536, nosync, fused）
+### 7.1 Pad 基线配置（EP8, mbs=1, ga=4, rc_off, pad1536, nosync, fused）
 
-| 指标 | 值 |
-|---|---|
-| **单步耗时** | 4.89s |
-| **吞吐（WPS）** | 1132 words/s |
-| **AI Core 利用率** | 23.46% (均值), 38.31% (峰值) |
-| **HBM 占用** | 58.77 GB/64GB (96.7%) |
-| **功耗** | 340.32W |
-| **Loss** | 正常收敛，无 NaN |
+| 指标 | 值 | 来源 |
+|---|---|---|
+| **单步耗时** | 4.89s | 38 轮配置扫描最优稳定配置 |
+| **吞吐（WPS）** | 1132 words/s | 严格满足 HBM 55-60GB 目标 |
+| **AI Core 利用率** | 23.46% (均值), 38.31% (峰值) | npu-smi 采集 |
+| **HBM 占用** | 56.4 GB/64GB (88%) | 稳定 80 步无 OOM |
+| **功耗** | 340.32W | - |
+| **Loss** | 正常收敛，无 NaN | - |
 
-### 优化目标（Phase 1: MC2）
+### 7.2 MC2 通信-计算重叠（代码已接通，待音频 EP8 实测）
 
-| 指标 | 目标 |
-|---|---|
-| **单步耗时** | 4.3-4.5s (降低 10-15%) |
-| **吞吐（WPS）** | 1230-1290 words/s (提升 10-15%) |
-| **AI Core 利用率** | 25-28% (小幅提升) |
-| **HBM 占用** | 55-60GB (维持) |
+**状态**：
+- ✅ 算子可用性已探测（`npu_alltoallv_gmm` / `npu_gmm_alltoallv` 在 CANN8.5 可用）
+- ✅ 代码已接通（`expert_parallel.py` + `modeling_qwen3_5_moe.py:946` 支持 `dispatcher: mc2`）
+- ⏳ **音频 EP8 实测待完成**（数学一致性验证 + 性能复测）
+
+**预期收益（理论分析）**：
+
+| 指标 | Pad 基线 (pad1536 fused) | MC2 预期 | 预期收益 |
+|---|---|---|---|
+| **单步耗时** | 4.89s | 4.3-4.5s | -10~-15% |
+| **吞吐（WPS）** | 1132 | 1230-1290 | +10~+15% |
+| **AI Core 利用率** | 23.46% | 25-28% | +2~5% |
+| **HBM 占用** | 56.4 GB | 55-60GB | 维持 |
+
+> 预期收益来自通信掩盖：forward (当前 2.66s) 和 backward (当前 1.62s) 阶段的 AllToAll
+> 通信被掩盖到专家 GEMM 后面，节省通信暴露时间。详见
+> [`reports/moe_optimization_strategy_from_blog_20260616.md`](reports/moe_optimization_strategy_from_blog_20260616.md) Phase 1。
+
+**启用方式**（待验证）：
+
+```yaml
+# parallel.ep_plan 段
+ep_plan:
+  apply_modules:
+  - model.language_model.layers.{*}.mlp.experts
+  dispatcher: mc2  # ← 启用 MC2 融合算子
+```
+
+参考配置：`configs/perf_tuning/ep8_mbs1_ga4_rc_off_pad1536_nosync_mc2.yaml`
+
+### 7.3 Pack 格式优化（其他分支已实测）
+
+Pack 格式（消除样本内 padding）在 `feat/llm-pad-to-pack` 和 `feat/llm-pad-to-pack-recompute` 分支已验证：
+- `feat/llm-pad-to-pack`: mbs=1 rc_off，**WPS 2069 (+79%)**，HBM ~40GB (-27%)
+- `feat/llm-pad-to-pack-recompute`: 新增 recompute 配置，rc_on WPS 1475，HBM 33GB (-7GB)
+
+MC2 与 pack 的组合（MC2 + pack mbs=1）为后续最高优先级方向。
 
 ---
 
@@ -283,7 +318,7 @@ export HCCL_DETERMINISTIC=1
 ## 九、贡献者
 
 - **作者**: Sejin
-- **生成时间**: 2026-06-16
+- **生成时间**: 2026-06-17
 - **框架**: MindSpeed-MM 26.0.0 on Ascend 910B3
 
 ---
@@ -301,5 +336,5 @@ export HCCL_DETERMINISTIC=1
 **快速链接**：
 - [快速开始](QWEN35_AUDIO_TRAINING_GUIDE.md)
 - [项目约束](CLAUDE.md)
-- [MoE 优化策略](reports/moe_optimization_strategy_from_blog_20260616.md)
-- [性能调优报告](reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md)
+- [MoE 优化策略（含 MC2）](reports/moe_optimization_strategy_from_blog_20260616.md)
+- [Pad 调优报告（38 轮扫描）](reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md)
