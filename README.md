@@ -1,221 +1,138 @@
-# Qwen3.5-35B-A3B + Whisper-large-v3 LoRA 微调复现仓库
+# Pack 格式优化分支 (feat/llm-pad-to-pack-recompute)
 
-**任务**: Qwen3.5-35B-A3B + Whisper-large-v3 LoRA 微调性能优化  
-**环境**: 单机 8 卡 Ascend 910B3, CANN 8.5.0, MindSpeed-MM 26.0.0  
-**约束**: 不改模型结构/MoE 路由/专家数量; LoRA-only; 数学一致; HBM 55-60G
-
-**最新成果（feat/llm-pad-to-pack-recompute）**: LLM pad→pack 改造，原生 FA2 varlen，
-mbs=1 实测 **WPS 2111 (+82%)、HBM 40GB (-27%)、单步 3.6s (-25%)**，详见
-[`pack_format_validation_report.md`](pack_format_validation_report.md)。
+> **分支用途**: LLM 序列 pad→pack 改造 + recompute 策略验证  
+> **核心成果**: WPS 2111 (+86%)，HBM 40GB (-29%)，历史最高吞吐  
+> **完整报告**: [`pack_format_validation_report.md`](pack_format_validation_report.md)
 
 ---
 
-## 一、仓库结构
+## 一、核心成果
 
-```
-baseline_26/
-├── README.md                          # 本文件
-├── CLAUDE.md                          # 项目约束（核心规则）
-├── QWEN35_AUDIO_TRAINING_GUIDE.md    # 快速开始指南
-├── STATUS_QWEN35_AUDIO_TRAINING.md   # 当前状态总结
-├── WORK_SUMMARY_JUN1-5.md            # 历史工作总结
-├── README_XUCHEN2_CONVERSION.md      # 权重转换说明
-├── STATUS_XUCHEN2_CONVERSION.md      # 转换状态
-│
-├── reports/                          # 性能报告&分析文档
-│   ├── moe_optimization_strategy_from_blog_20260616.md  # **核心优化策略**
-│   ├── qwen35_audio_manual_ep8_perf_tuning_20260616.md  # 最新性能调优报告
-│   └── ...                           # 历史报告
-│
-├── mindspeed_mm_patches/             # **MindSpeed-MM 26.0.0 源码改动 (patch)**
-│   ├── README.md                     # 版本锚点 + 复现步骤 + 与报告对应关系
-│   ├── 01_source_code.patch          # 框架源码改动 (MC2 核心 + 音频插件)
-│   ├── 02_examples_configs.patch     # 训练脚本 + 221 个 perf_tuning yaml
-│   └── 00_full_commit_46de4e18.patch # 全量兜底
-│
-├── configs/perf_tuning/              # 头牌配置便捷副本 (fused 基线 vs MC2)
-│
-└── scripts/                          # 训练&调试脚本
-    ├── train_qwen35_audio.sh         # 训练启动脚本
-    ├── train_qwen35_audio.yaml       # 训练配置
-    ├── env_cann85.sh                 # CANN 8.5 环境脚本
-    ├── run_audio_perf_experiment.sh  # 性能实验脚本
-    ├── run_qwen35_audio_moe_blog_tuning_suite.sh  # MC2优化suite
-    ├── make_audio_perf_configs.py    # 配置生成器
-    ├── analyze_audio_perf_run.py     # 性能分析脚本
-    ├── verify_mc2_equivalence.py     # MC2数学一致性验证
-    ├── mc2_equivalence_hook.py       # MC2一致性hook
-    ├── npu_monitor_full.py           # NPU监控脚本
-    ├── prepare_audio_data.py         # 数据准备工具
-    └── ...                           # 其他辅助脚本
-```
+| 配置 | WPS | HBM/卡 | 单步耗时 | 状态 | 收益 |
+|------|-----|--------|----------|------|------|
+| **pack mbs=1 rc_off** | **2111** | 40 GB | 3.6s | ✅ 80步稳定 | vs pad1133: **+86% WPS, -29% HBM** |
+| pack mbs=1 rc_on | 1475 | 33 GB | 5.0s | ✅ 80步稳定 | HBM -7GB, WPS -30% |
+| pack mbs=2 rc_off | N/A | N/A | N/A | ❌ FSDP2 hang | 跨 rank 序列长度不一致 |
+| pack mbs=2 rc_on | N/A | N/A | N/A | ❌ FSDP2 hang | 同上 |
+
+**历史最高吞吐**: Pack mbs=1 rc_off, **WPS 2111**, HBM 40GB, 单步 3.6s
 
 ---
 
-## 二、快速开始
+## 二、Pack 格式原理
+
+### 核心机制
+
+**Pad 格式**（传统）:
+```
+Sample 1: [audio1] text1 <pad><pad><pad>     # 长度 800，补到 1536
+Sample 2: [audio2] text2 <pad><pad><pad><pad> # 长度 600，补到 1536
+Sample 3: [audio3] text3 <pad>                # 长度 1200，补到 1536
+--> 3 个样本，3×1536 = 4608 tokens，其中 1872 个 padding (40.6% 浪费)
+```
+
+**Pack 格式**（本分支）:
+```
+Packed: [audio1] text1 [audio2] text2 [audio3] text3  # 总长度 2600
+--> 1 个拼接序列，2600 真实 tokens，0 padding (0% 浪费)
+```
+
+### 关键技术
+
+1. **多样本拼接**: collator 将多个样本 concat 成单序列
+2. **Position IDs 重启**: 每个样本的 position_ids 从 0 开始，边界处重启
+3. **FA2 varlen**: position_ids 触发 transformers 原生 FA2 varlen 路径（`npu_flash_attn_varlen_func`）
+4. **Cu_seqlens 推导**: 从 position_ids 的跳变点推导 cu_seqlens（累积序列长度）
+
+**代码位置**:
+- `mindspeed_mm/fsdp/models/qwen3_5_audio/modeling_qwen3_5_audio.py`: forward 支持 pack 检测
+- `mindspeed_mm/fsdp/data/dataloader/packed_collator_wrapper.py`: 拼接逻辑
+- `mindspeed_mm/fsdp/data/dataloader/data_collator.py`: 注册 `qwen3vl_packed`
+
+---
+
+## 三、Recompute 策略
+
+### Layer-wise Recompute
+
+**配置**:
+```yaml
+parallel:
+  recompute: true
+  recompute_plan:
+    apply_modules:
+    - model.language_model.layers.{*}  # 只 checkpoint 每一层
+```
+
+**原理**:
+- PyTorch `checkpoint` 包装每个 Transformer layer 的 forward
+- 前向不存激活，backward 时重跑前向再算梯度
+- **不包 `language_model` 整体**：避免 checkpoint layer loop 导致中间态显存回升
+
+**实测效果**:
+- HBM: 40GB → 33GB (-7GB)
+- WPS: 2111 → 1475 (-30%)
+- 适用场景：显存受限，吞吐可牺牲
+
+---
+
+## 四、快速开始
 
 ### 1. 环境准备
 
-**硬件要求**：
-- 8×Ascend 910B3 (64GB HBM/卡)
-- CANN 8.5.0 + ATB/NNAL
-
-**软件环境**：
 ```bash
-# 固定 CANN 8.5 环境（全程使用）
-source /usr/local/Ascend/cann-8.5.0/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
+# 加载 CANN 8.5 环境
+source scripts/env_cann85.sh
+source /data/sejin/env/venv_cann85/bin/activate
 
-# Python 虚拟环境
-python3 -m venv venv_qwen35
-source venv_qwen35/bin/activate
-
-# 安装 MindSpeed-MM 26.0.0
-# （参考 MindSpeed-MM 官方文档安装 torch_npu, transformers, peft 等依赖）
+# 验证环境
+npu-smi info | head -5
+python3 -c "import torch_npu; print(torch_npu.__version__)"  # 应输出 2.6.0.post1+cann85
 ```
 
-### 2. 模型准备
+### 2. 配置文件
 
-**需要下载的模型**：
-1. **Qwen3.5-35B-A3B-audio-dcp**（69GB，MCore DCP格式）
-   - 路径配置：修改 `scripts/train_qwen35_audio.yaml` 中的 `model_path`
-   
-2. **whisper-large-v3**（2.9-5.8GB，HF格式）
-   - 路径配置：修改 `scripts/train_qwen35_audio.yaml` 中的 `whisper_path`
-
-### 3. 数据准备
-
-按照 `QWEN35_AUDIO_TRAINING_GUIDE.md` 准备音频训练数据：
-
+**Pack rc_off（最优吞吐）**:
 ```bash
-# 创建数据目录
-mkdir -p data_audio
-
-# 准备 JSONL 格式训练数据（示例）
-# data_audio/train.jsonl:
-# {"id": "sample_001", "audios": ["/path/to/audio1.wav"], "messages": [{"role": "user", "content": "<|AUDIO|>\n请转写这段语音。"}, {"role": "assistant", "content": "今天天气很好。"}]}
+# 188 机器配置
+/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_pack_188.yaml
 ```
 
-### 4. 训练启动
-
-**小规模测试（10步）**：
+**Pack rc_on（显存受限）**:
 ```bash
-cd scripts
-# 修改 train_qwen35_audio.yaml: max_steps: 10
-./train_qwen35_audio.sh
+/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_mbs1_ga4_rc_on_pack_188.yaml
 ```
 
-**完整训练（500步）**：
+### 3. 启动训练
+
 ```bash
-# 修改 train_qwen35_audio.yaml: max_steps: 500
-./train_qwen35_audio.sh
+# 必须设置环境变量（数据预处理需要）
+export AUDIO_PLACEHOLDER="<|AUDIO|>"
+
+# 启动训练（80步验证）
+cd /data/sejin/third_party/mindspeed-mm-26.0.0
+bash examples/qwen3_5_audio/scripts/train_qwen35_audio.sh \
+  --config examples/qwen3_5_audio/perf_tuning/ep8_pack_188.yaml \
+  --max_steps 80
+```
+
+### 4. 监控性能
+
+```bash
+# 实时监控 NPU
+watch -n 1 npu-smi info
+
+# 查看训练日志（WPS/HBM/Loss）
+tail -f /data/sejin/output/qwen35_audio_ckpt/train.log
 ```
 
 ---
 
-## 三、核心文档速查
+## 五、配置说明
 
-| 文档 | 用途 |
-|---|---|
-| `CLAUDE.md` | **项目硬约束**（必读）：环境切换、故障处置、优化范围、指标规范 |
-| `QWEN35_AUDIO_TRAINING_GUIDE.md` | 训练快速开始指南 |
-| `STATUS_QWEN35_AUDIO_TRAINING.md` | 当前工作状态&下一步行动 |
-| `pack_format_validation_report.md` | **Pack 格式验证报告**（最新成果：WPS +82%，HBM -27%） |
-| `reports/qwen35_audio_llm_pack_perf_20260616.md` | Pack 格式早期探索数据 |
-| `reports/moe_optimization_strategy_from_blog_20260616.md` | **MoE 优化策略**（基于博客+实测） |
-| `reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md` | Pad 格式调优报告（38 轮配置扫描） |
-
----
-
-## 四、性能优化工作流
-
-### Phase 1: 基线采集
-```bash
-# 使用默认配置跑通训练，采集基线指标
-cd scripts
-./train_qwen35_audio.sh
-
-# 性能分析
-python3 analyze_audio_perf_run.py --run-dir ../output/qwen35_audio_ckpt
-```
-
-### Phase 2: MC2 通信-计算重叠优化
-```bash
-# 生成 MC2 优化配置
-python3 make_audio_perf_configs.py --enable-mc2
-
-# 运行优化实验
-./run_qwen35_audio_moe_blog_tuning_suite.sh
-
-# 对比分析
-python3 analyze_audio_perf_run.py --baseline baseline_run --optimized mc2_run
-```
-
-### Phase 3: 报告生成
-```bash
-# 生成性能对比报告
-python3 write_qwen35_audio_moe_blog_report.py \
-    --baseline-metrics ../metrics/baseline.json \
-    --mc2-metrics ../metrics/mc2.json \
-    --output ../reports/mc2_optimization_report_$(date +%Y%m%d).md
-```
-
----
-
-## 五、关键配置说明
-
-### 5.1 并行策略（EP8 手动分片）
-
-当前使用 **手动专家并行 EP=8**（非自动 FSDP2 EP）：
+### Pack 格式核心配置
 
 ```yaml
-# train_qwen35_audio.yaml
-parallel:
-  tp: 1
-  pp: 1
-  cp: 1
-  ep: 8  # 专家并行度
-
-ep_plan:
-  mode: manual
-  ep_size: 8
-  dispatcher: fused  # 可选: fused (默认), mc2 (通信-计算重叠)
-```
-
-### 5.2 LoRA 配置
-
-```yaml
-lora:
-  enable: true
-  rank: 16
-  alpha: 32
-  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]  # 仅专家 FFN
-  lora_dtype: bfloat16
-```
-
-### 5.3 显存优化
-
-```yaml
-recompute:
-  enable: false  # mbs=1 下显存足够，不需要重计算
-
-memory:
-  micro_batch_size: 1
-  gradient_accumulation_steps: 4
-  max_seq_length: 1536  # 填充到此长度
-```
-
-### 5.4 Pack 格式（推荐，最优吞吐）
-
-Pack 格式消除样本内 padding，用原生 FA2 varlen，mbs=1 实测 WPS +82%、HBM -27%。
-
-```yaml
-# parallel 段
-recompute: false            # rc_off 吞吐最优；显存紧张时设 true（layer-wise）
-recompute_plan:
-  apply_modules:
-  - model.language_model.layers.{*}   # recompute 必须停在 layer 粒度
-
 # data.dataloader_param.collate_param 段
 collate_param:
   model_name: qwen3vl_packed          # ← 启用 pack collator
@@ -224,148 +141,103 @@ collate_param:
 
 # model 段
 attn_implementation: flash_attention_2  # 必需，触发 NPU varlen FA2
+
+# parallel 段（rc_off 配置）
+parallel:
+  recompute: false                    # 吞吐优先
+  expert_parallel_size: 8
+  ep_plan:
+    apply_modules:
+    - model.language_model.layers.{*}.mlp.experts
+    dispatcher: fused                 # 或 mc2（待验证）
+
+# parallel 段（rc_on 配置）
+parallel:
+  recompute: true                     # 显存优先
+  recompute_plan:
+    apply_modules:
+    - model.language_model.layers.{*}
 ```
 
-启动前必须设环境变量（数据预处理校验 `<|AUDIO|>` 占位符）：
+---
 
-```bash
-export AUDIO_PLACEHOLDER="<|AUDIO|>"
+## 六、已知限制
+
+### 1. mbs=2 FSDP2 hang
+
+**现象**: pack 格式在 `micro_batch_size: 2` 时，训练卡在 FSDP2 lazy init 的 all-gather
+
+**根因**: 各 rank collator 独立拼接，导致跨 rank 序列长度不一致，FSDP2 all-gather 需要统一 shape
+
+**解决方向**: 在 `PackedCollatorWrapper` 加跨 rank 全局长度对齐
+- 各 rank 在 collate 前通过 `dist.all_reduce` 同步全局 max_seq_length
+- 所有 rank 统一 pad 到该长度（仅跨 rank 对齐，样本内仍保持 pack）
+
+### 2. WPS 统计口径差异
+
+**Pad 格式**: WPS 包含 padding token（虚高）  
+**Pack 格式**: WPS 只统计真实 token（准确）
+
+对比时需注意：pack WPS 2111 vs pad WPS 1133 不是单纯 +86%，pad 的 1133 中约 40% 是 padding。
+
+---
+
+## 七、与其他方案对比
+
+| 方案 | WPS | HBM/卡 | 实测状态 | 适用场景 |
+|------|-----|--------|----------|---------|
+| **Pack rc_off** | 2111 | 40 GB | ✅ 本分支 | 吞吐优先，HBM 充足 |
+| Pack rc_on | 1475 | 33 GB | ✅ 本分支 | 显存受限（<40GB） |
+| Pad1536 rc_off | 1133 | 56.4 GB | ✅ mc2-perf-eval | Pad 最优稳定配置 |
+| Pad + MC2 | 1230-1290 | 55-60 GB | ⏳ 预期 | Pad 通信优化 |
+| **Pack + MC2** | 2320+ | ~40 GB | 🎯 待验证 | **理论最优** |
+
+---
+
+## 八、下一步方向
+
+### 🎯 Priority 1: Pack + MC2 组合
+
+在 pack rc_off 基础上启用 MC2 通信-计算重叠:
+```yaml
+parallel:
+  ep_plan:
+    dispatcher: mc2  # ← 改为 mc2
 ```
 
-> ⚠️ **当前限制**：pack 格式仅支持 `micro_batch_size: 1`。mbs>1 会在 FSDP2 lazy
-> init 的 all-gather 处 hang（跨 rank 序列长度不一致），需在 collator 加跨 rank
-> 长度对齐才能解除。详见 `pack_format_validation_report.md`。
+预期: WPS 2111 → 2320+ (+10%)
 
-参考配置（188 实机）：
-- `examples/qwen3_5_audio/perf_tuning/ep8_pack_188.yaml`（mbs=1, rc_off）
-- `examples/qwen3_5_audio/perf_tuning/ep8_mbs1_ga4_rc_on_pack_188.yaml`（mbs=1, rc_on）
+### ⏳ Priority 2: Pack mbs>1
 
----
+解决 FSDP2 hang，解锁更高 batch 吞吐
 
-## 六、故障排查
+### 📋 Priority 3: Selective recompute
 
-### 6.1 OOM（显存不足）
-
-```bash
-# 降低 max_seq_length
-# 修改 train_qwen35_audio.yaml: max_seq_length: 1024
-
-# 或启用重计算
-# recompute.enable: true
-```
-
-### 6.2 通信超时
-
-```bash
-# 拉长 HCCL 超时时间
-export HCCL_EXEC_TIMEOUT=1800
-
-# 开启全量日志
-export ASCEND_GLOBAL_LOG_LEVEL=0
-export HCCL_DETERMINISTIC=1
-```
-
-### 6.3 mbs=2 挂死问题
-
-**现象**：micro_batch_size=2 时，训练在 step 24 左右挂死（外部 SIGTERM）。
-
-**原因**：已尝试 23 种配置（bucket16/32/64, chunk512, emptycache, timeout, nosync, rc_on），均失败。推测为 CANN 8.5 环境级 bug。
-
-**建议**：
-- 维持 mbs=1（稳定）
-- 通过 MC2 通信重叠优化吞吐，而非强推 mbs=2
-- 如必须 mbs=2，需联系昇腾支持
+探索更细粒度 recompute（只 checkpoint MLP 或 attention），平衡 HBM/WPS
 
 ---
 
-## 七、性能指标参考
+## 九、参考资料
 
-### 7.1 Pad 基线配置（EP8, mbs=1, ga=4, rc_off, pad1536, nosync, fused）
+### 完整报告
 
-| 指标 | 值 |
-|---|---|
-| **单步耗时** | 4.89s |
-| **吞吐（WPS）** | 1132 words/s |
-| **AI Core 利用率** | 23.46% (均值), 38.31% (峰值) |
-| **HBM 占用** | 58.77 GB/64GB (96.7%) |
-| **功耗** | 340.32W |
-| **Loss** | 正常收敛，无 NaN |
+- **本分支**: [`pack_format_validation_report.md`](pack_format_validation_report.md)
+- **早期版本**: [`reports/qwen35_audio_llm_pack_perf_20260616.md`](reports/qwen35_audio_llm_pack_perf_20260616.md)
 
-### 7.2 Pack 格式实测（feat/llm-pad-to-pack-recompute 分支，8×910B3, EP8）
+### 项目文档（main 分支）
 
-> **核心成果**：LLM 序列 pad→pack 改造，消除样本内 padding，原生 FA2 varlen。
-> 详见 [`pack_format_validation_report.md`](pack_format_validation_report.md)。
-
-| 配置 | mbs | recompute | 状态 | WPS | HBM/卡 | 单步耗时 | 备注 |
-|---|---|---|---|---|---|---|---|
-| **pack rc_off** | 1 | ❌ | ✅ 80步稳定 | **2111** | 40 GB | 3.6s | **最优吞吐配置** |
-| pack rc_on | 1 | ✅ | ✅ 80步稳定 | 1475 | 33 GB | 5.0s | 显存受限时用，-7GB HBM |
-| pack rc_off | 2 | ❌ | ❌ FSDP2 hang | N/A | N/A | N/A | 跨 rank 序列长度不一致 |
-| pack rc_on | 2 | ✅ | ❌ FSDP2 hang | N/A | N/A | N/A | 同上（非显存问题） |
-
-**Pack vs Pad 收益（mbs=1, rc_off, 对标 pad1408）**：
-
-| 指标 | Pad 基线 (pad1408) | Pack | 收益 |
-|---|---|---|---|
-| **吞吐（WPS）** | 1158 | **2111** | **+82%** |
-| **单步耗时** | 4.8s | 3.6s | **-25%** |
-| **HBM 占用** | 54.6 GB | 40 GB | **-27%** |
-| **Loss 收敛** | 正常 | 正常 (4.83→4.62) | 一致 |
-
-> WPS 大幅提升原因：pad 基线的 WPS 口径含 padding token，pack 统计的全是真实 token（零样本内 padding）。
-
-**Recompute 策略**：layer-wise（`model.language_model.layers.{*}`），用 PyTorch `checkpoint` 逐层包装，
-避免 checkpoint 整个 `language_model` 导致 layer loop 中间态显存回升。
-
-### 7.3 优化目标（后续: MC2 + mbs>1）
-
-| 方向 | 目标 | 状态 |
-|---|---|---|
-| **MC2 通信-计算重叠** | 在 pack 配置接入 `dispatcher: mc2` | 代码已有，pack 未启用 |
-| **mbs>1** | 跨 rank 序列对齐，解 FSDP2 hang | 待实现（collator 加全局长度对齐） |
-
----
-
-## 八、参考资料
-
-### 8.1 博客与文档
-
-- **MoE 优化方案知识分享**（核心参考）：
-  - 《从 Token 路由到昇腾/MindSpeed 落地》（知乎，2026）
-  
-- **昇腾官方文档**：
-  - https://www.hiascend.com/document/detail/zh/Pytorch/700/modthirdparty/Mindspeedguide/mindspeed_0044.html
-  - https://www.hiascend.com/developer/techArticles/20250702-1
-
-### 8.2 MindSpeed-MM 26.0.0
-
-- 官方示例：`examples/qwen3_5_audio/`
-- 模型插件：`mindspeed_mm/fsdp/models/qwen3_5_audio/`
-- EP 实现：`mindspeed_mm/core/parallel/expert_parallel.py`
-
----
-
-## 九、贡献者
-
-- **作者**: Sejin
-- **生成时间**: 2026-06-17
-- **框架**: MindSpeed-MM 26.0.0 on Ascend 910B3
-
----
-
-## 十、许可证
-
-本仓库仅用于学术研究和性能评测，不包含模型权重和训练数据。
-
-模型权重需自行下载：
-- Qwen3.5-35B-A3B: [Qwen 官方](https://github.com/QwenLM/Qwen)
-- Whisper-large-v3: [OpenAI Whisper](https://github.com/openai/whisper)
-
----
-
-**快速链接**：
+- [项目约束 (CLAUDE.md)](https://github.com/Kimsale/qwen3.5_35B_mindspeed/blob/main/CLAUDE.md)
+- [项目状态 (STATUS.md)](https://github.com/Kimsale/qwen3.5_35B_mindspeed/blob/main/STATUS_QWEN35_AUDIO_TRAINING.md)
 - [快速开始](QWEN35_AUDIO_TRAINING_GUIDE.md)
-- [项目约束](CLAUDE.md)
-- [Pack 格式验证报告](pack_format_validation_report.md)
-- [MoE 优化策略](reports/moe_optimization_strategy_from_blog_20260616.md)
-- [Pad 调优报告](reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md)
+
+### 其他分支
+
+- **main**: https://github.com/Kimsale/qwen3.5_35B_mindspeed
+- **mc2-perf-eval**: Pad 格式 38 轮扫描 + MC2 代码接通
+- **feat/llm-pad-to-pack**: Pack 格式初版（WPS 2069）
+
+---
+
+**最后更新**: 2026-06-17  
+**分支状态**: 活跃开发  
+**下次同步**: Pack + MC2 组合验证完成后
