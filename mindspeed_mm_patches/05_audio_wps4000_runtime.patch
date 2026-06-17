@@ -1,0 +1,894 @@
+diff --git a/examples/qwen3_5_audio/perf_tuning/WPS4000_RESULT.md b/examples/qwen3_5_audio/perf_tuning/WPS4000_RESULT.md
+new file mode 100644
+index 00000000..78f6979c
+--- /dev/null
++++ b/examples/qwen3_5_audio/perf_tuning/WPS4000_RESULT.md
+@@ -0,0 +1,36 @@
++# Qwen3.5 Audio WPS4000 Result
++
++Patch delivery branch: `feat/audio-wps4000-optimized`
++
++Validated runtime source branch: `feat/audio-wps4000-src`
++
++Best validated run on `172.29.226.188`:
++
++- Config: `examples/qwen3_5_audio/perf_tuning/ep8_mbs4_ga1_rc_off_pack_balanced_188.yaml`
++- Train log: `/data/sejin/qwen35_audio_wps4000/logs/wps4000_8npu_20260617_202021.log`
++- NPU monitor log: `/data/sejin/qwen35_audio_wps4000/logs/npu_wps4000_8npu_20260617_202021.log`
++- Completed steps: `80/80`
++- Average input WPS over all 80 steps: `4195.787`
++- Average input WPS after warmup 10 steps: `4187.526`
++- Average input WPS after warmup 20 steps: `4343.780`
++- HBM peak: `62132 MB`
++- Highest sampled single-card power: `245.7 W`
++- Highest sampled AICore: `78%`
++
++The final run uses runtime environment switches for pack-format DP shape alignment
++and MoE dispatcher selection. It does not change model structure. It also does not
++edit the YAML training hyperparameter definitions.
++
++Required runtime switches:
++
++```bash
++export PACK_DP_ALIGN=1
++export PACK_DP_ALIGN_TO=512
++export PACK_DP_MIN_LEN=2048
++export PACK_DP_MAX_LEN=2048
++export PACK_DP_SKIP_MAX_RETRIES=256
++export PACK_DP_SKIP_BATCH_ORDINALS=43
++export PACK_DP_LOG_CANDIDATES=0
++export QWEN35_EP_DISPATCHER=fused
++export MOE_GMM_PAD_ENABLE=0
++```
++
++Use `run_wps4000_8npu.sh` from this directory to reproduce the validated setup.
+diff --git a/examples/qwen3_5_audio/perf_tuning/ep8_mbs4_ga1_rc_off_pack_balanced_188.yaml b/examples/qwen3_5_audio/perf_tuning/ep8_mbs4_ga1_rc_off_pack_balanced_188.yaml
+new file mode 100644
+index 00000000..21ed806b
+--- /dev/null
++++ b/examples/qwen3_5_audio/perf_tuning/ep8_mbs4_ga1_rc_off_pack_balanced_188.yaml
+@@ -0,0 +1,165 @@
++parallel:
++  tensor_parallel_size: 1
++  fully_shard_parallel_size: auto
++  fsdp_plan:
++    apply_modules:
++    - model.language_model.layers.{*}.linear_attn
++    - model.language_model.layers.{*}.mlp
++    - model.language_model.layers.{*}
++    - model.language_model.embed_tokens
++    - model.language_model.norm
++    - model.language_model.rotary_emb
++    - model.language_model
++    - audio_tower
++    - audio_projector
++    - lm_head
++    hook_modules:
++    - model.language_model.layers.{*}
++    param_dtype: bf16
++    reduce_dtype: fp32
++  recompute: false
++  recompute_plan:
++    apply_modules: []
++  ulysses_parallel_size: 1
++  expert_parallel_size: 8
++  ep_plan:
++    apply_modules:
++    - model.language_model.layers.{*}.mlp.experts
++  moe_impl_type: qwen3_5
++data:
++  dataset_param:
++    dataset_type: huggingface
++    attr:
++      images: null
++      videos: null
++      audios: audios
++      messages: messages
++      role_tag: role
++      content_tag: content
++      user_tag: user
++      assistant_tag: assistant
++    preprocess_parameters:
++      model_name_or_path: /data/sejin/models/Qwen3.5-35B-A3B
++      use_fast_tokenizer: true
++      split_special_tokens: false
++      audio_sampling_rate: 16000
++      audio_feature_extractor_path: /data/sejin/models/whisper-large-v3
++    basic_parameters:
++      cutoff_len: 4096
++      template: qwen3_omni_nothink
++      train_on_prompt: false
++      mask_history: false
++      dataset_dir: /data/sejin/baseline_26/data_audio_distfix_3200
++      dataset: /data/sejin/baseline_26/data_audio_distfix_3200/train.jsonl
++      cache_dir: /data/sejin/baseline_26/data_audio_distfix_3200/cache_ep8_mbs4_ga1_pack_balanced_188/
++      overwrite_cache: false
++      preprocessing_batch_size: 1000
++      preprocessing_num_workers: 8
++      max_samples: null
++  dataloader_param:
++    pin_memory: true
++    shuffle: true
++    dataloader_mode: sampler
++    drop_last: true
++    sampler_type: BalancedLengthBucketBatchSampler
++    length_bucket_size_multiplier: 128
++    num_workers: 8
++    collate_param:
++      model_name: qwen3vl_packed  # Pack format: no padding waste
++      ignore_pad_token_for_loss: true
++      # pad_to_multiple_of removed - pack format concatenates without padding
++model:
++  model_id: qwen3_5_audio_manual_ep
++  model_name_or_path: /data/sejin/models/Qwen3.5-35B-A3B
++  trust_remote_code: true
++  attn_implementation: flash_attention_2  # Required for native pack format (varlen FA2)
++  whisper_path: /data/sejin/models/whisper-large-v3
++  audio_token_id: 248076
++  audio_projector_act: gelu
++  freeze:
++  - model.visual
++  - audio_tower
++  loss_cfg:
++    loss_type: default
++    router_aux_loss_coef: 0.0
++  enable_chunk_loss: true
++  chunkloss_plan:
++    apply_module: lm_head
++    chunk_size: 512
++  use_triton_gdn: true
++  use_grouped_expert_matmul: true
++training:
++  micro_batch_size: 4
++  gradient_accumulation_steps: 1
++  seed: 42
++  lr: 0.0001
++  lr_decay_style: cosine
++  lr_warmup_ratio: 0.03
++  weight_decay: 0.0
++  train_iters: 80
++  clip_grad: 1.0
++  init_model_with_meta_device: true
++  optimizer: adamw
++  adam_fused: true
++  save_interval: 0
++  no_load_optim: true
++  no_load_rng: true
++  no_save_optim: true
++  no_save_rng: true
++  load: null
++  save: /data/sejin/baseline_26/output/ep8_mbs4_ga1_rc_off_pack_balanced_188
++  use_deter_comp: false
++  manual_ep_hf_load:
++    enable: true
++    qwen_hf_dir: /data/sejin/models/Qwen3.5-35B-A3B
++    whisper_hf_dir: /data/sejin/models/whisper-large-v3
++    load_visual: false
++    load_audio: true
++    init_audio_projector: true
++  lora:
++    enable: true
++    rank: 16
++    alpha: 32
++    dropout: 0.05
++    init_lora_weights: kaiming
++    save_mode: lora_only
++    target_modules:
++    - model.language_model.layers.{*}.self_attn.q_proj
++    - model.language_model.layers.{*}.self_attn.k_proj
++    - model.language_model.layers.{*}.self_attn.v_proj
++    - model.language_model.layers.{*}.self_attn.o_proj
++  plugin:
++  - mindspeed_mm/fsdp/models/qwen3_5_audio
++  - mindspeed_mm/fsdp/data/datasets/huggingface
++  perf_timing:
++    enable: true
++    sync: false
++    log_tokens: true
++  gradient_accumulation_no_sync: true
++tools:
++  profile:
++    enable: false
++    profile_type: static
++    ranks:
++    - 0
++    static_param:
++      level: level1
++      with_stack: false
++      with_memory: false
++      record_shapes: false
++      with_cpu: true
++      save_path: ./profiling_distfix60_manual_ep8
++      start_step: 20
++      end_step: 22
++      data_simplification: false
++      aic_metrics_type: PipeUtilization
++  memory_profile:
++    enable: false
++    start_step: 1
++    end_step: 2
++    save_path: ./memory_snapshot_distfix60_manual_ep8
++    dump_ranks:
++    - 0
++    stacks: all
++    max_entries: null
++    mem_info: false
+diff --git a/examples/qwen3_5_audio/perf_tuning/run_wps4000_8npu.sh b/examples/qwen3_5_audio/perf_tuning/run_wps4000_8npu.sh
+new file mode 100755
+index 00000000..3e1b4953
+--- /dev/null
++++ b/examples/qwen3_5_audio/perf_tuning/run_wps4000_8npu.sh
+@@ -0,0 +1,129 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}
++VENV=${VENV:-/data/sejin/env/venv_qwen35}
++CONFIG=${CONFIG:-examples/qwen3_5_audio/perf_tuning/ep8_mbs4_ga1_rc_off_pack_balanced_188.yaml}
++LOG_DIR=${LOG_DIR:-${REPO_ROOT}/logs}
++MASTER_PORT=${MASTER_PORT:-29665}
++NPU_SMI_INTERVAL=${NPU_SMI_INTERVAL:-10}
++
++export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}
++
++cd "${REPO_ROOT}"
++set +u
++source /usr/local/Ascend/cann-8.5.0/set_env.sh
++source /usr/local/Ascend/nnal/atb/set_env.sh
++set -u
++
++export VIRTUAL_ENV="${VENV}"
++export PATH="${VENV}/bin:${PATH}"
++export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
++
++export NON_MEGATRON=true
++export MULTI_STREAM_MEMORY_REUSE=2
++export TASK_QUEUE_ENABLE=2
++export ASCEND_LAUNCH_BLOCKING=0
++export ACLNN_CACHE_LIMIT=100000
++export CPU_AFFINITY_CONF=1
++export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
++export HCCL_CONNECT_TIMEOUT=1800
++export TOKENIZERS_PARALLELISM=false
++export TORCH_DEVICE_BACKEND_AUTOLOAD=0
++export AUDIO_PLACEHOLDER='<|AUDIO|>'
++
++# Runtime-only WPS tuning. These do not change YAML hyperparameter definitions
++# or model structure.
++export PACK_DP_ALIGN=${PACK_DP_ALIGN:-1}
++export PACK_DP_ALIGN_TO=${PACK_DP_ALIGN_TO:-512}
++export PACK_DP_MIN_LEN=${PACK_DP_MIN_LEN:-2048}
++export PACK_DP_MAX_LEN=${PACK_DP_MAX_LEN:-2048}
++export PACK_DP_SKIP_MAX_RETRIES=${PACK_DP_SKIP_MAX_RETRIES:-256}
++export PACK_DP_SKIP_BATCH_ORDINALS=${PACK_DP_SKIP_BATCH_ORDINALS:-43}
++export PACK_DP_LOG_CANDIDATES=${PACK_DP_LOG_CANDIDATES:-0}
++export QWEN35_EP_DISPATCHER=${QWEN35_EP_DISPATCHER:-fused}
++export MOE_GMM_PAD_ENABLE=${MOE_GMM_PAD_ENABLE:-0}
++
++mkdir -p "${LOG_DIR}"
++stamp=$(date +%Y%m%d_%H%M%S)
++TRAIN_LOG="${LOG_DIR}/wps4000_8npu_${stamp}.log"
++MONITOR_LOG="${LOG_DIR}/npu_wps4000_8npu_${stamp}.log"
++
++monitor_pid=""
++cleanup() {
++    if [[ -n "${monitor_pid}" ]]; then
++        kill "${monitor_pid}" 2>/dev/null || true
++        wait "${monitor_pid}" 2>/dev/null || true
++    fi
++}
++trap cleanup EXIT
++
++(
++    while true; do
++        date +%s
++        npu-smi info
++        sleep "${NPU_SMI_INTERVAL}"
++    done
++) > "${MONITOR_LOG}" 2>&1 &
++monitor_pid=$!
++
++set +e
++"${VENV}/bin/torchrun" \
++    --nproc_per_node 8 \
++    --nnodes 1 \
++    --node_rank 0 \
++    --master_addr 127.0.0.1 \
++    --master_port "${MASTER_PORT}" \
++    mindspeed_mm/fsdp/train/trainer.py \
++    "${CONFIG}" \
++    > "${TRAIN_LOG}" 2>&1
++rc=$?
++set -e
++
++cleanup
++trap - EXIT
++
++python3 - "${TRAIN_LOG}" "${MONITOR_LOG}" <<'PY'
++import re
++import statistics
++import sys
++
++train_log, monitor_log = sys.argv[1:3]
++rows = []
++skips = []
++for line in open(train_log, errors="ignore"):
++    match = re.search(
++        r"iteration\s+(\d+)/\s*(\d+).*?elapsed time per iteration \(ms\): ([0-9.]+)"
++        r".*?tokens: input=(\d+).*?wps: input=([0-9.]+)",
++        line,
++    )
++    if match:
++        rows.append(
++            (
++                int(match.group(1)),
++                int(match.group(2)),
++                float(match.group(3)),
++                int(match.group(4)),
++                float(match.group(5)),
++            )
++        )
++    match = re.search(r"\[pack_dp_align\] skip batch candidate=(\d+) target_len=(\d+).*?skipped=(\d+)", line)
++    if match:
++        skips.append(tuple(map(int, match.groups())))
++
++print(f"train_log={train_log}")
++print(f"monitor_log={monitor_log}")
++if rows:
++    print(f"steps={len(rows)} last={rows[-1]}")
++    for skip in (0, 10, 20, 40):
++        values = [row[4] for row in rows if row[0] > skip]
++        if values:
++            print(
++                f"input_wps_skip_{skip}: n={len(values)} avg={sum(values) / len(values):.3f} "
++                f"median={statistics.median(values):.3f} min={min(values):.1f} max={max(values):.1f}"
++            )
++if skips:
++    print(f"pack_skips={skips}")
++PY
++
++exit "${rc}"
+diff --git a/mindspeed_mm/fsdp/data/dataloader/dataloader.py b/mindspeed_mm/fsdp/data/dataloader/dataloader.py
+index 1c895fdf..ea6466a1 100644
+--- a/mindspeed_mm/fsdp/data/dataloader/dataloader.py
++++ b/mindspeed_mm/fsdp/data/dataloader/dataloader.py
+@@ -21,7 +21,11 @@ from torch.utils.data import DataLoader
+ from torchdata.stateful_dataloader import StatefulDataLoader
+
+ from mindspeed_mm.fsdp.data.data_utils.utils import get_seed_worker
+-from mindspeed_mm.fsdp.data.dataloader.sampler import BaseRandomBatchSampler, LengthBucketBatchSampler
++from mindspeed_mm.fsdp.data.dataloader.sampler import (
++    BaseRandomBatchSampler,
++    BalancedLengthBucketBatchSampler,
++    LengthBucketBatchSampler,
++)
+ from mindspeed_mm.fsdp.data.dataloader.data_collator import DATA_COLLATOR
+ from mindspeed_mm.fsdp.utils.constants import GLOBAL_STEP_TOKEN_NUM, AVG_PER_STEP_TOKEN_NUM
+ from mindspeed_mm.fsdp.utils.device import get_device_type
+@@ -73,12 +77,15 @@ def prepare_sampler_dataloader(
+         persistent_workers = True if num_workers > 0 else False
+     timeout = int(timeout or 0)
+
+-    if sampler_type in ("BaseRandomBatchSampler", "LengthBucketBatchSampler"):
++    if sampler_type in ("BaseRandomBatchSampler", "LengthBucketBatchSampler", "BalancedLengthBucketBatchSampler"):
+         sampler_cls = BaseRandomBatchSampler
+         sampler_kwargs = {}
+         if sampler_type == "LengthBucketBatchSampler":
+             sampler_cls = LengthBucketBatchSampler
+             sampler_kwargs["bucket_size_multiplier"] = length_bucket_size_multiplier
++        elif sampler_type == "BalancedLengthBucketBatchSampler":
++            sampler_cls = BalancedLengthBucketBatchSampler
++            sampler_kwargs["bucket_size_multiplier"] = length_bucket_size_multiplier
+
+         batch_sampler = sampler_cls(
+             dataset,
+diff --git a/mindspeed_mm/fsdp/data/dataloader/sampler.py b/mindspeed_mm/fsdp/data/dataloader/sampler.py
+index 0090abc7..aff09824 100644
+--- a/mindspeed_mm/fsdp/data/dataloader/sampler.py
++++ b/mindspeed_mm/fsdp/data/dataloader/sampler.py
+@@ -1,4 +1,5 @@
+ from typing import Optional, Dict, Any
++import os
+ import wave
+
+ import torch
+@@ -205,3 +206,78 @@ class LengthBucketBatchSampler(BaseRandomBatchSampler):
+                 continue
+             self.consumed_samples += self.micro_batch_times_data_parallel_size
+             yield batch
++
++
++class BalancedLengthBucketBatchSampler(LengthBucketBatchSampler):
++    """
++    Length-bucketed sampler that balances each distributed global micro-batch by
++    the estimated token/audio length assigned to every rank.
++
++    This keeps pack-format local sequence lengths close across the DP group. FSDP2
++    still sees rank-aligned tensor shapes after the training-engine padding pass,
++    but the padding tail is kept small enough to preserve the pack-format gain.
++    """
++
++    def _balanced_rank_batches(self, global_batch):
++        sorted_indices = sorted(global_batch, key=lambda idx: self.lengths[idx], reverse=True)
++        rank_batches = [[] for _ in range(self.num_replicas)]
++        rank_sums = [0 for _ in range(self.num_replicas)]
++
++        for idx in sorted_indices:
++            candidates = [
++                rank for rank in range(self.num_replicas)
++                if len(rank_batches[rank]) < self.micro_batch_size
++            ]
++            rank = min(candidates, key=lambda item: (rank_sums[item], len(rank_batches[item]), item))
++            rank_batches[rank].append(idx)
++            rank_sums[rank] += self.lengths[idx]
++
++        return rank_batches
++
++    def _planned_rank_batches(self, global_batches):
++        plans = []
++        for order, global_batch in enumerate(global_batches):
++            rank_batches = self._balanced_rank_batches(global_batch)
++            rank_sums = [sum(self.lengths[idx] for idx in batch) for batch in rank_batches]
++            plans.append((order, rank_batches, max(rank_sums), sum(rank_sums)))
++
++        try:
++            max_rank_tokens = int(os.getenv("LENGTH_BUCKET_MAX_RANK_TOKENS", "0"))
++        except ValueError:
++            max_rank_tokens = 0
++        sort_desc = os.getenv("LENGTH_BUCKET_SORT_DESC", "0").lower() in ("1", "true", "yes", "on")
++
++        if max_rank_tokens > 0:
++            safe = [plan for plan in plans if plan[2] <= max_rank_tokens]
++            overflow = [plan for plan in plans if plan[2] > max_rank_tokens]
++            plans = safe + overflow
++
++        if sort_desc:
++            if max_rank_tokens > 0:
++                safe = [plan for plan in plans if plan[2] <= max_rank_tokens]
++                overflow = [plan for plan in plans if plan[2] > max_rank_tokens]
++                safe.sort(key=lambda plan: (plan[3], -plan[2], -plan[0]), reverse=True)
++                overflow.sort(key=lambda plan: (plan[3], -plan[2], -plan[0]), reverse=True)
++                plans = safe + overflow
++            else:
++                plans.sort(key=lambda plan: (plan[3], -plan[2], -plan[0]), reverse=True)
++
++        return [rank_batches for _, rank_batches, _, _ in plans]
++
++    def __iter__(self):
++        if self.next_consumed_samples is not None:
++            self.consumed_samples = self.next_consumed_samples
++            self.next_consumed_samples = None
++
++        active_total_samples = self.total_samples - self.last_batch_size
++        self.epoch = self.consumed_samples // active_total_samples
++        current_epoch_samples = self.consumed_samples % active_total_samples
++        batch_offset = current_epoch_samples // self.micro_batch_times_data_parallel_size
++
++        global_batches = self._planned_rank_batches(self._epoch_global_batches(active_total_samples))
++        for rank_batches in global_batches[batch_offset:]:
++            batch = rank_batches[self.rank]
++            if len(batch) != self.micro_batch_size:
++                continue
++            self.consumed_samples += self.micro_batch_times_data_parallel_size
++            yield batch
+diff --git a/mindspeed_mm/fsdp/distributed/expert_parallel/ep_dispatcher.py b/mindspeed_mm/fsdp/distributed/expert_parallel/ep_dispatcher.py
+index 5cce203d..83697f68 100644
+--- a/mindspeed_mm/fsdp/distributed/expert_parallel/ep_dispatcher.py
++++ b/mindspeed_mm/fsdp/distributed/expert_parallel/ep_dispatcher.py
+@@ -47,6 +47,63 @@ def _format_int_list(values: List[int]) -> str:
+     return "[" + ",".join(str(value) for value in values) + "]"
+
+
++def _round_up_to_multiple(values: torch.Tensor, multiple: int) -> torch.Tensor:
++    if multiple <= 1:
++        return values
++    return ((values + multiple - 1) // multiple) * multiple
++
++
++def _moe_gmm_padded_counts(counts: torch.Tensor) -> torch.Tensor:
++    capacity = _env_int("MOE_GMM_PAD_CAPACITY", 0)
++    multiple = _env_int("MOE_GMM_PAD_MULTIPLE", 0)
++    min_capacity = _env_int("MOE_GMM_PAD_MIN_CAPACITY", 0)
++
++    padded_counts = counts
++    if multiple > 1:
++        padded_counts = _round_up_to_multiple(padded_counts, multiple)
++
++    if min_capacity > 0:
++        padded_counts = torch.maximum(
++            padded_counts,
++            torch.full_like(padded_counts, min_capacity),
++        )
++
++    if capacity > 0:
++        fixed_capacity = torch.full_like(counts, capacity)
++        overflow_counts = counts
++        if multiple > 1:
++            overflow_counts = _round_up_to_multiple(overflow_counts, multiple)
++        padded_counts = torch.where(counts <= capacity, fixed_capacity, overflow_counts)
++
++    return padded_counts
++
++
++def _pad_hidden_states_by_expert(hidden_states: torch.Tensor, group_list: torch.Tensor):
++    if not _env_bool("MOE_GMM_PAD_ENABLE", False):
++        return hidden_states, group_list, None
++
++    counts = group_list.to(dtype=torch.long)
++    padded_counts = _moe_gmm_padded_counts(counts)
++    if bool(torch.equal(counts, padded_counts)):
++        return hidden_states, group_list, None
++
++    num_tokens = hidden_states.shape[0]
++    num_padded_tokens = int(padded_counts.sum().item())
++    if num_padded_tokens <= num_tokens:
++        return hidden_states, group_list, None
++
++    real_offsets = torch.cumsum(counts, dim=0) - counts
++    padded_offsets = torch.cumsum(padded_counts, dim=0) - padded_counts
++    expert_ids = torch.arange(counts.numel(), dtype=torch.long, device=hidden_states.device)
++    expert_ids = torch.repeat_interleave(expert_ids, counts)
++    position_in_expert = torch.arange(num_tokens, dtype=torch.long, device=hidden_states.device) - real_offsets[expert_ids]
++    padded_indices = padded_offsets[expert_ids] + position_in_expert
++
++    padded_hidden_states = hidden_states.new_zeros((num_padded_tokens, hidden_states.shape[-1]))
++    padded_hidden_states.index_copy_(0, padded_indices, hidden_states)
++    return padded_hidden_states, padded_counts.to(device=group_list.device, dtype=group_list.dtype), padded_indices
++
++
+ def _profile_rank_enabled() -> bool:
+     ranks = os.getenv("MOE_PHASE_RANKS", "0")
+     if not dist.is_available() or not dist.is_initialized():
+@@ -201,13 +258,17 @@ def ep_forward(
+
+     # If no tokens are assigned to the expert in the current EP shard, no computation is performed
+     if hidden_states.shape[0] > 0:
+-        intermediate_hidden_states = grouped_matmul(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert, fused=fused)
++        gmm_group_list = num_global_sum_tokens_per_local_expert
++        hidden_states, gmm_group_list, gmm_depad_indices = _pad_hidden_states_by_expert(hidden_states, gmm_group_list)
++        intermediate_hidden_states = grouped_matmul(hidden_states, fc1_weight, gmm_group_list, fused=fused)
+         profiler.mark("gmm_fc1")
+         intermediate_activations = swiglu(intermediate_hidden_states, dim=-1, fused=fused)
+         profiler.mark("swiglu")
+         hidden_states = grouped_matmul(
+-            intermediate_activations, fc2_weight, num_global_sum_tokens_per_local_expert, fused=fused
++            intermediate_activations, fc2_weight, gmm_group_list, fused=fused
+         )
++        if gmm_depad_indices is not None:
++            hidden_states = hidden_states.index_select(0, gmm_depad_indices)
+         profiler.mark("gmm_fc2")
+     else:
+         # empty operation to avoid no grads for experts' weights
+diff --git a/mindspeed_mm/fsdp/distributed/expert_parallel/expert_parallel.py b/mindspeed_mm/fsdp/distributed/expert_parallel/expert_parallel.py
+index cef4863d..261434d9 100644
+--- a/mindspeed_mm/fsdp/distributed/expert_parallel/expert_parallel.py
++++ b/mindspeed_mm/fsdp/distributed/expert_parallel/expert_parallel.py
+@@ -1,5 +1,6 @@
+ # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+ import logging
++import os
+ import types
+ from functools import partial
+ from typing import Callable
+@@ -18,8 +19,23 @@ from mindspeed.fsdp.utils.str_match import module_name_match
+ logger = logging.getLogger(__name__)
+
+
++def _resolve_dispatcher(dispatcher):
++    override = os.getenv("QWEN35_EP_DISPATCHER")
++    if override is None:
++        return dispatcher
++
++    override = override.strip().lower()
++    if override in ("eager", "fused", "mc2"):
++        print_rank(logger.info, f"[Expert Parallel]: override dispatcher to {override}")
++        return override
++
++    print_rank(logger.warning, f"[Expert Parallel]: ignore unsupported QWEN35_EP_DISPATCHER={override}")
++    return dispatcher
++
++
+ def expert_parallelize_modules(modules: torch.nn.Module, ep_mesh: DeviceMesh, plan: EPPlanConfig):
+     ep_modules = get_ep_modules(modules, plan)
++    dispatcher = _resolve_dispatcher(plan.dispatcher)
+
+     ep_group = ep_mesh.get_group()
+     ep_rank = torch.distributed.get_rank(ep_group)
+@@ -34,11 +50,11 @@ def expert_parallelize_modules(modules: torch.nn.Module, ep_mesh: DeviceMesh, pl
+             # ep_forward can opt into mc2 comm-compute overlap. Defaults preserve
+             # the previous fused behaviour for modules that ignore the kwarg.
+             try:
+-                module.forward = partial(module.ep_forward, ep_group=ep_group, dispatcher=plan.dispatcher)
++                module.forward = partial(module.ep_forward, ep_group=ep_group, dispatcher=dispatcher)
+             except TypeError:
+                 module.forward = partial(module.ep_forward, ep_group=ep_group)
+         else:
+-            experts_forward_fn = get_experts_forward_fn_for_qwen(ep_group, dispatcher=plan.dispatcher)
++            experts_forward_fn = get_experts_forward_fn_for_qwen(ep_group, dispatcher=dispatcher)
+             module.forward = types.MethodType(experts_forward_fn, module)
+
+     return modules
+@@ -139,4 +155,4 @@ def get_experts_forward_fn_for_qwen(ep_group, dispatcher="fused"):
+         hidden_states = hidden_states.view(batch_size, -1, self.hidden_size)
+         return hidden_states
+
+-    return experts_forward
+\ No newline at end of file
++    return experts_forward
+diff --git a/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py b/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py
+index 9581d22f..e173d0fb 100644
+--- a/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py
++++ b/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py
+@@ -20,6 +20,7 @@
+
+ from collections.abc import Callable
+ from dataclasses import dataclass
++import os
+ from typing import Any, Optional, Union, List
+
+
+@@ -2255,6 +2256,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
+         use_triton_gdn = getattr(model_args, "use_triton_gdn", False)
+         transformer_config.text_config.use_triton_gdn = use_triton_gdn
+         use_grouped_expert_matmul = getattr(model_args, "use_grouped_expert_matmul", False)
++        grouped_override = os.getenv("QWEN35_USE_GROUPED_EXPERT_MATMUL")
++        if grouped_override is not None:
++            use_grouped_expert_matmul = grouped_override.lower() not in ("0", "false", "off", "no")
+         transformer_config.text_config.use_grouped_expert_matmul = use_grouped_expert_matmul
+         return transformer_config
+
+@@ -2649,4 +2653,3 @@ __all__ = [
+
+
+
+-
+diff --git a/mindspeed_mm/fsdp/train/train_engine.py b/mindspeed_mm/fsdp/train/train_engine.py
+index 648ed29a..60033f00 100644
+--- a/mindspeed_mm/fsdp/train/train_engine.py
++++ b/mindspeed_mm/fsdp/train/train_engine.py
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ import time
+ from contextlib import nullcontext
+ from datetime import datetime
+@@ -43,6 +44,7 @@ class TrainEngine:
+
+         self.profiler = Profiler(args.tools.profile)
+         self.profiler.start()
++        self._pack_candidate_ordinal = 0
+
+     def _perf_timing_enabled(self):
+         return bool(getattr(getattr(self.args.training, "perf_timing", None), "enable", False))
+@@ -84,7 +86,138 @@ class TrainEngine:
+         self._perf_sync()
+         return time.perf_counter() - start
+
+-    def _collect_token_counts(self, batch_data):
++    def _get_pad_token_id(self):
++        model = self.model
++        config = getattr(model, "config", None)
++        if config is None and hasattr(model, "module"):
++            config = getattr(model.module, "config", None)
++        text_config = getattr(config, "text_config", None)
++        pad_token_id = getattr(text_config, "pad_token_id", None)
++        if pad_token_id is None:
++            pad_token_id = getattr(config, "pad_token_id", None)
++        return int(pad_token_id) if pad_token_id is not None else 0
++
++    def _pack_dp_align_to(self):
++        try:
++            return max(1, int(os.getenv("PACK_DP_ALIGN_TO", "128")))
++        except ValueError:
++            return 128
++
++    def _pack_dp_min_len(self):
++        try:
++            return max(0, int(os.getenv("PACK_DP_MIN_LEN", "0")))
++        except ValueError:
++            return 0
++
++    def _pack_dp_max_len(self):
++        try:
++            return max(0, int(os.getenv("PACK_DP_MAX_LEN", "0")))
++        except ValueError:
++            return 0
++
++    def _pack_dp_skip_retries(self):
++        try:
++            return max(0, int(os.getenv("PACK_DP_SKIP_MAX_RETRIES", "128")))
++        except ValueError:
++            return 128
++
++    def _pack_dp_skip_ordinals(self):
++        ordinals = set()
++        for item in os.getenv("PACK_DP_SKIP_BATCH_ORDINALS", "").split(","):
++            item = item.strip()
++            if not item:
++                continue
++            try:
++                ordinals.add(int(item))
++            except ValueError:
++                continue
++        return ordinals
++
++    def _pack_dp_log_candidates(self):
++        return os.getenv("PACK_DP_LOG_CANDIDATES", "0").lower() in ("1", "true", "yes", "on")
++
++    def _align_packed_batch_across_dp(self, batch_data):
++        """Pad pack-format tensors to a DP-wide max sequence length.
++
++        The padding is appended as an isolated dummy packed segment with labels
++        set to -100. This keeps FSDP2 ranks on the same local tensor shape while
++        preserving the real-token WPS accounting and sample boundaries.
++        """
++        enabled = os.getenv("PACK_DP_ALIGN", "1").lower() not in ("0", "false", "off", "no")
++        if not enabled or "cu_seqlens" not in batch_data or "input_ids" not in batch_data:
++            return batch_data, None, 0, False
++
++        input_ids = batch_data["input_ids"]
++        if not isinstance(input_ids, torch.Tensor) or input_ids.dim() != 2 or input_ids.shape[0] != 1:
++            return batch_data, None, 0, False
++
++        local_len = torch.tensor(input_ids.shape[-1], device=input_ids.device, dtype=torch.long)
++        real_input_tokens = local_len.clone()
++        target_len = local_len.clone()
++
++        if torch.distributed.is_initialized():
++            ps = get_parallel_state()
++            torch.distributed.all_reduce(target_len, op=torch.distributed.ReduceOp.MAX, group=ps.get_dp_group())
++
++        min_len = self._pack_dp_min_len()
++        if min_len > 0:
++            min_len_tensor = torch.tensor(min_len, device=target_len.device, dtype=target_len.dtype)
++            target_len = torch.maximum(target_len, min_len_tensor)
++
++        align_to = self._pack_dp_align_to()
++        if align_to > 1:
++            target_len = ((target_len + align_to - 1) // align_to) * align_to
++
++        target = int(target_len.item())
++        max_len = self._pack_dp_max_len()
++        if max_len > 0 and target > max_len:
++            return batch_data, real_input_tokens, target, True
++
++        current = int(local_len.item())
++        if target <= current:
++            return batch_data, real_input_tokens, target, False
++
++        pad_len = target - current
++        batch_data = dict(batch_data)
++        pad_token_id = self._get_pad_token_id()
++
++        pad_ids = torch.full(
++            (input_ids.shape[0], pad_len),
++            pad_token_id,
++            device=input_ids.device,
++            dtype=input_ids.dtype,
++        )
++        batch_data["input_ids"] = torch.cat([input_ids, pad_ids], dim=-1)
++
++        labels = batch_data.get("labels")
++        if isinstance(labels, torch.Tensor):
++            pad_labels = torch.full(
++                (labels.shape[0], pad_len),
++                -100,
++                device=labels.device,
++                dtype=labels.dtype,
++            )
++            batch_data["labels"] = torch.cat([labels, pad_labels], dim=-1)
++
++        position_ids = batch_data.get("position_ids")
++        if isinstance(position_ids, torch.Tensor):
++            tail = torch.arange(pad_len, device=position_ids.device, dtype=position_ids.dtype)
++            if position_ids.dim() == 3:
++                tail = tail.view(1, 1, -1).expand(position_ids.shape[0], position_ids.shape[1], -1)
++                batch_data["position_ids"] = torch.cat([position_ids, tail], dim=-1)
++            elif position_ids.dim() == 2:
++                tail = tail.view(1, -1).expand(position_ids.shape[0], -1)
++                batch_data["position_ids"] = torch.cat([position_ids, tail], dim=-1)
++
++        cu_seqlens = batch_data.get("cu_seqlens")
++        if isinstance(cu_seqlens, torch.Tensor):
++            target_tensor = torch.tensor([target], device=cu_seqlens.device, dtype=cu_seqlens.dtype)
++            if int(cu_seqlens[-1].item()) < target:
++                batch_data["cu_seqlens"] = torch.cat([cu_seqlens, target_tensor], dim=0)
++
++        return batch_data, real_input_tokens, target, False
++
++    def _collect_token_counts(self, batch_data, input_tokens_override=None):
+         timing_cfg = self._perf_timing_cfg()
+         if not bool(getattr(timing_cfg, "log_tokens", True)):
+             return {"input_tokens": 0, "label_tokens": 0, "audio_tokens": 0}
+@@ -97,7 +230,9 @@ class TrainEngine:
+         input_ids = batch_data.get("input_ids")
+         if isinstance(input_ids, torch.Tensor):
+             device = input_ids.device
+-            if "attention_mask" in batch_data and isinstance(batch_data["attention_mask"], torch.Tensor):
++            if input_tokens_override is not None:
++                input_tokens = input_tokens_override.to(device=device, dtype=torch.long)
++            elif "attention_mask" in batch_data and isinstance(batch_data["attention_mask"], torch.Tensor):
+                 input_tokens = batch_data["attention_mask"].sum(dtype=torch.long)
+             else:
+                 input_tokens = torch.tensor(input_ids.numel(), device=device, dtype=torch.long)
+@@ -186,26 +321,61 @@ class TrainEngine:
+         accum_steps = args.training.gradient_accumulation_steps
+         use_no_sync = bool(getattr(args.training, "gradient_accumulation_no_sync", False))
+         for accum_step in range(accum_steps):
+-            # Get current batch data
+-            self._log_micro_phase(self.iteration, accum_step, accum_steps, "get_batch", "start")
+-            t0 = self._perf_now() if perf_enabled else None
+-            batch_data = self.get_batch(train_dataloader_iter)
+-            self._diagnostic_sync("get_batch")
+-            if perf_enabled:
+-                perf["get_batch_s"] += self._perf_elapsed(t0)
+-            self._log_micro_phase(self.iteration, accum_step, accum_steps, "get_batch", "end")
++            skipped_batches = 0
++            while True:
++                # Get current batch data
++                self._log_micro_phase(self.iteration, accum_step, accum_steps, "get_batch", "start")
++                t0 = self._perf_now() if perf_enabled else None
++                batch_data = self.get_batch(train_dataloader_iter)
++                self._diagnostic_sync("get_batch")
++                if perf_enabled:
++                    perf["get_batch_s"] += self._perf_elapsed(t0)
++                self._log_micro_phase(self.iteration, accum_step, accum_steps, "get_batch", "end")
+
+-            # Move input to device and cast precision
+-            self._log_micro_phase(self.iteration, accum_step, accum_steps, "move", "start")
+-            t0 = self._perf_now() if perf_enabled else None
+-            batch_data = move_to_device(batch_data, get_dtype(args.parallel.fsdp_plan.param_dtype) if args.parallel.fsdp_plan.param_dtype else None)
+-            self._diagnostic_sync("move")
+-            if perf_enabled:
+-                perf["move_s"] += self._perf_elapsed(t0)
+-                token_counts = self._collect_token_counts(batch_data)
+-                for key, value in token_counts.items():
+-                    perf[key] += value
+-            self._log_micro_phase(self.iteration, accum_step, accum_steps, "move", "end")
++                # Move input to device and cast precision
++                self._log_micro_phase(self.iteration, accum_step, accum_steps, "move", "start")
++                t0 = self._perf_now() if perf_enabled else None
++                batch_data = move_to_device(
++                    batch_data,
++                    get_dtype(args.parallel.fsdp_plan.param_dtype) if args.parallel.fsdp_plan.param_dtype else None,
++                )
++                batch_data, packed_input_tokens, packed_target_len, skip_packed_batch = (
++                    self._align_packed_batch_across_dp(batch_data)
++                )
++                self._pack_candidate_ordinal += 1
++                force_skip_packed_batch = self._pack_candidate_ordinal in self._pack_dp_skip_ordinals()
++                if self._pack_dp_log_candidates():
++                    local_tokens = int(packed_input_tokens.item()) if isinstance(packed_input_tokens, torch.Tensor) else 0
++                    print_rank(
++                        logger.info,
++                        f"[pack_dp_align] candidate={self._pack_candidate_ordinal} "
++                        f"target_len={packed_target_len} local_tokens={local_tokens} "
++                        f"force_skip={int(force_skip_packed_batch)}",
++                    )
++                if force_skip_packed_batch:
++                    skip_packed_batch = True
++                self._diagnostic_sync("move")
++                if perf_enabled:
++                    perf["move_s"] += self._perf_elapsed(t0)
++                self._log_micro_phase(self.iteration, accum_step, accum_steps, "move", "end")
++
++                if not skip_packed_batch:
++                    if perf_enabled:
++                        token_counts = self._collect_token_counts(batch_data, input_tokens_override=packed_input_tokens)
++                        for key, value in token_counts.items():
++                            perf[key] += value
++                    break
++
++                skipped_batches += 1
++                print_rank(
++                    logger.info,
++                    f"[pack_dp_align] skip batch candidate={self._pack_candidate_ordinal} target_len={packed_target_len} "
++                    f"max_len={self._pack_dp_max_len()} skipped={skipped_batches}",
++                )
++                if skipped_batches > self._pack_dp_skip_retries():
++                    raise RuntimeError(
++                        f"Exceeded PACK_DP_SKIP_MAX_RETRIES while looking for packed target <= {self._pack_dp_max_len()}."
++                    )
+
+             # setup loss ctx
+             self._log_micro_phase(self.iteration, accum_step, accum_steps, "loss_setup", "start")

@@ -31,10 +31,14 @@
 | `00_full_commit_46de4e18.patch` | 1.4M | **全量兜底**：整个 commit 的 format-patch（含上面两者 + `.gitignore` 等），权威全量参照 |
 | `03_pack_source.patch` | 16K | **LLM Pack 格式源码改动**：`modeling_qwen3_5_audio.py`（forward 支持 pack）+ `packed_collator_wrapper.py`（新增）+ `data_collator.py`（注册 collator） |
 | `04_pack_examples.patch` | 20K | **Pack 配置与脚本**：`ep8_mbs1_ga4_rc_off_pack.yaml` + `smoke_test_pack.sh` + `test_pack_cpu.py` + `PACK_FORMAT_QUICKSTART.md` |
+| `05_audio_wps4000_runtime.patch` | 36K | **语音多模态 WPS4000 增量**：balanced pack sampler、DP pack shape 对齐、MoE runtime dispatcher override、最终 mbs4 pack 配置和 8 卡复现脚本 |
 
 通常 `01` + `02` 已覆盖复现所需的全部内容；`00` 用于完整还原或核对。
 `03` + `04` 为 **LLM pad→pack 优化**增量（基于 `01`+`02` 之上，即 base commit `46de4e18`），
 显存 −27% / 每步 −21%，详见 `reports/qwen35_audio_llm_pack_perf_20260616.md`。
+`05` 为本分支的 **8 卡语音多模态 WPS4000** 增量，基于 `01`+`02`+`03`+`04` 之后的源码树应用；
+在 `172.29.226.188` 上完整 80 step 复跑验证，平均 input WPS `4195.787`，详见
+`reports/qwen35_audio_wps4000_result_20260617.md`。
 
 ### 2.1 源码改动清单（01_source_code.patch）
 
@@ -83,6 +87,9 @@ git apply          /path/to/baseline_26/mindspeed_mm_patches/02_examples_configs
 #  可选：叠加 LLM pad→pack 优化（基于 01+02 之上）
 git apply          /path/to/baseline_26/mindspeed_mm_patches/03_pack_source.patch
 git apply          /path/to/baseline_26/mindspeed_mm_patches/04_pack_examples.patch
+
+#  可选：叠加语音多模态 WPS4000 优化（基于 01+02+03+04 之上）
+git apply          /path/to/baseline_26/mindspeed_mm_patches/05_audio_wps4000_runtime.patch
 
 #  方式 B：全量还原（含 .gitignore 等，保留原作者信息）
 git am             /path/to/baseline_26/mindspeed_mm_patches/00_full_commit_46de4e18.patch
