@@ -4,6 +4,10 @@
 **环境**: 单机 8 卡 Ascend 910B3, CANN 8.5.0, MindSpeed-MM 26.0.0  
 **约束**: 不改模型结构/MoE 路由/专家数量; LoRA-only; 数学一致; HBM 55-60G
 
+**最新成果（feat/llm-pad-to-pack-recompute）**: LLM pad→pack 改造，原生 FA2 varlen，
+mbs=1 实测 **WPS 2111 (+82%)、HBM 40GB (-27%)、单步 3.6s (-25%)**，详见
+[`pack_format_validation_report.md`](pack_format_validation_report.md)。
+
 ---
 
 ## 一、仓库结构
@@ -116,8 +120,10 @@ cd scripts
 | `CLAUDE.md` | **项目硬约束**（必读）：环境切换、故障处置、优化范围、指标规范 |
 | `QWEN35_AUDIO_TRAINING_GUIDE.md` | 训练快速开始指南 |
 | `STATUS_QWEN35_AUDIO_TRAINING.md` | 当前工作状态&下一步行动 |
+| `pack_format_validation_report.md` | **Pack 格式验证报告**（最新成果：WPS +82%，HBM -27%） |
+| `reports/qwen35_audio_llm_pack_perf_20260616.md` | Pack 格式早期探索数据 |
 | `reports/moe_optimization_strategy_from_blog_20260616.md` | **MoE 优化策略**（基于博客+实测） |
-| `reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md` | 最新性能调优报告 |
+| `reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md` | Pad 格式调优报告（38 轮配置扫描） |
 
 ---
 
@@ -199,6 +205,41 @@ memory:
   max_seq_length: 1536  # 填充到此长度
 ```
 
+### 5.4 Pack 格式（推荐，最优吞吐）
+
+Pack 格式消除样本内 padding，用原生 FA2 varlen，mbs=1 实测 WPS +82%、HBM -27%。
+
+```yaml
+# parallel 段
+recompute: false            # rc_off 吞吐最优；显存紧张时设 true（layer-wise）
+recompute_plan:
+  apply_modules:
+  - model.language_model.layers.{*}   # recompute 必须停在 layer 粒度
+
+# data.dataloader_param.collate_param 段
+collate_param:
+  model_name: qwen3vl_packed          # ← 启用 pack collator
+  ignore_pad_token_for_loss: true
+  # 不要设 pad_to_multiple_of（pack 拼接不需要 padding）
+
+# model 段
+attn_implementation: flash_attention_2  # 必需，触发 NPU varlen FA2
+```
+
+启动前必须设环境变量（数据预处理校验 `<|AUDIO|>` 占位符）：
+
+```bash
+export AUDIO_PLACEHOLDER="<|AUDIO|>"
+```
+
+> ⚠️ **当前限制**：pack 格式仅支持 `micro_batch_size: 1`。mbs>1 会在 FSDP2 lazy
+> init 的 all-gather 处 hang（跨 rank 序列长度不一致），需在 collator 加跨 rank
+> 长度对齐才能解除。详见 `pack_format_validation_report.md`。
+
+参考配置（188 实机）：
+- `examples/qwen3_5_audio/perf_tuning/ep8_pack_188.yaml`（mbs=1, rc_off）
+- `examples/qwen3_5_audio/perf_tuning/ep8_mbs1_ga4_rc_on_pack_188.yaml`（mbs=1, rc_on）
+
 ---
 
 ## 六、故障排查
@@ -239,7 +280,7 @@ export HCCL_DETERMINISTIC=1
 
 ## 七、性能指标参考
 
-### 基线配置（EP8, mbs=1, ga=4, rc_off, pad1536, nosync, fused）
+### 7.1 Pad 基线配置（EP8, mbs=1, ga=4, rc_off, pad1536, nosync, fused）
 
 | 指标 | 值 |
 |---|---|
@@ -250,14 +291,38 @@ export HCCL_DETERMINISTIC=1
 | **功耗** | 340.32W |
 | **Loss** | 正常收敛，无 NaN |
 
-### 优化目标（Phase 1: MC2）
+### 7.2 Pack 格式实测（feat/llm-pad-to-pack-recompute 分支，8×910B3, EP8）
 
-| 指标 | 目标 |
-|---|---|
-| **单步耗时** | 4.3-4.5s (降低 10-15%) |
-| **吞吐（WPS）** | 1230-1290 words/s (提升 10-15%) |
-| **AI Core 利用率** | 25-28% (小幅提升) |
-| **HBM 占用** | 55-60GB (维持) |
+> **核心成果**：LLM 序列 pad→pack 改造，消除样本内 padding，原生 FA2 varlen。
+> 详见 [`pack_format_validation_report.md`](pack_format_validation_report.md)。
+
+| 配置 | mbs | recompute | 状态 | WPS | HBM/卡 | 单步耗时 | 备注 |
+|---|---|---|---|---|---|---|---|
+| **pack rc_off** | 1 | ❌ | ✅ 80步稳定 | **2111** | 40 GB | 3.6s | **最优吞吐配置** |
+| pack rc_on | 1 | ✅ | ✅ 80步稳定 | 1475 | 33 GB | 5.0s | 显存受限时用，-7GB HBM |
+| pack rc_off | 2 | ❌ | ❌ FSDP2 hang | N/A | N/A | N/A | 跨 rank 序列长度不一致 |
+| pack rc_on | 2 | ✅ | ❌ FSDP2 hang | N/A | N/A | N/A | 同上（非显存问题） |
+
+**Pack vs Pad 收益（mbs=1, rc_off, 对标 pad1408）**：
+
+| 指标 | Pad 基线 (pad1408) | Pack | 收益 |
+|---|---|---|---|
+| **吞吐（WPS）** | 1158 | **2111** | **+82%** |
+| **单步耗时** | 4.8s | 3.6s | **-25%** |
+| **HBM 占用** | 54.6 GB | 40 GB | **-27%** |
+| **Loss 收敛** | 正常 | 正常 (4.83→4.62) | 一致 |
+
+> WPS 大幅提升原因：pad 基线的 WPS 口径含 padding token，pack 统计的全是真实 token（零样本内 padding）。
+
+**Recompute 策略**：layer-wise（`model.language_model.layers.{*}`），用 PyTorch `checkpoint` 逐层包装，
+避免 checkpoint 整个 `language_model` 导致 layer loop 中间态显存回升。
+
+### 7.3 优化目标（后续: MC2 + mbs>1）
+
+| 方向 | 目标 | 状态 |
+|---|---|---|
+| **MC2 通信-计算重叠** | 在 pack 配置接入 `dispatcher: mc2` | 代码已有，pack 未启用 |
+| **mbs>1** | 跨 rank 序列对齐，解 FSDP2 hang | 待实现（collator 加全局长度对齐） |
 
 ---
 
@@ -283,7 +348,7 @@ export HCCL_DETERMINISTIC=1
 ## 九、贡献者
 
 - **作者**: Sejin
-- **生成时间**: 2026-06-16
+- **生成时间**: 2026-06-17
 - **框架**: MindSpeed-MM 26.0.0 on Ascend 910B3
 
 ---
@@ -301,5 +366,6 @@ export HCCL_DETERMINISTIC=1
 **快速链接**：
 - [快速开始](QWEN35_AUDIO_TRAINING_GUIDE.md)
 - [项目约束](CLAUDE.md)
+- [Pack 格式验证报告](pack_format_validation_report.md)
 - [MoE 优化策略](reports/moe_optimization_strategy_from_blog_20260616.md)
-- [性能调优报告](reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md)
+- [Pad 调优报告](reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md)
