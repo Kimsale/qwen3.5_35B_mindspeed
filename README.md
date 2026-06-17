@@ -4,6 +4,10 @@
 **环境**: 单机 8 卡 Ascend 910B3, CANN 8.5.0, MindSpeed-MM 26.0.0  
 **约束**: 不改模型结构/MoE 路由/专家数量; LoRA-only; 数学一致; HBM 55-60G
 
+**本分支成果（feat/llm-pad-to-pack）**: LLM pad→pack 改造，原生 FA2 varlen，
+mbs=1 实测 **WPS 2069 (+79%)、HBM ~40GB (-27%)、单步 3.79s (-21%)**，详见
+[`reports/qwen35_audio_llm_pack_perf_20260616.md`](reports/qwen35_audio_llm_pack_perf_20260616.md)。
+
 ---
 
 ## 一、仓库结构
@@ -116,8 +120,9 @@ cd scripts
 | `CLAUDE.md` | **项目硬约束**（必读）：环境切换、故障处置、优化范围、指标规范 |
 | `QWEN35_AUDIO_TRAINING_GUIDE.md` | 训练快速开始指南 |
 | `STATUS_QWEN35_AUDIO_TRAINING.md` | 当前工作状态&下一步行动 |
+| `reports/qwen35_audio_llm_pack_perf_20260616.md` | **Pack 格式验证报告**（本分支核心成果：WPS +79%，HBM -27%） |
 | `reports/moe_optimization_strategy_from_blog_20260616.md` | **MoE 优化策略**（基于博客+实测） |
-| `reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md` | 最新性能调优报告 |
+| `reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md` | Pad 格式调优报告（38 轮配置扫描） |
 
 ---
 
@@ -199,6 +204,31 @@ memory:
   max_seq_length: 1536  # 填充到此长度
 ```
 
+### 5.4 Pack 格式（本分支核心优化，推荐）
+
+Pack 格式消除样本内 padding，用原生 FA2 varlen，mbs=1 实测 WPS +79%、HBM -27%。
+
+```yaml
+# data.dataloader_param.collate_param 段
+collate_param:
+  model_name: qwen3vl_packed          # ← 启用 pack collator
+  ignore_pad_token_for_loss: true
+  # 不要设 pad_to_multiple_of（pack 拼接不需要 padding）
+
+# model 段
+attn_implementation: flash_attention_2  # 必需，触发 NPU varlen FA2
+```
+
+启动前必须设环境变量（数据预处理校验 `<|AUDIO|>` 占位符）：
+
+```bash
+export AUDIO_PLACEHOLDER="<|AUDIO|>"
+```
+
+> ⚠️ **当前限制**：pack 格式仅验证了 mbs=1。更高吞吐方向见 `feat/llm-pad-to-pack-recompute` 分支（+recompute 配置）。
+
+实施细节和修复的问题详见 [`reports/qwen35_audio_llm_pack_perf_20260616.md`](reports/qwen35_audio_llm_pack_perf_20260616.md)。
+
 ---
 
 ## 六、故障排查
@@ -239,7 +269,7 @@ export HCCL_DETERMINISTIC=1
 
 ## 七、性能指标参考
 
-### 基线配置（EP8, mbs=1, ga=4, rc_off, pad1536, nosync, fused）
+### 7.1 Pad 基线配置（EP8, mbs=1, ga=4, rc_off, pad1536, nosync, fused）
 
 | 指标 | 值 |
 |---|---|
@@ -250,14 +280,36 @@ export HCCL_DETERMINISTIC=1
 | **功耗** | 340.32W |
 | **Loss** | 正常收敛，无 NaN |
 
-### 优化目标（Phase 1: MC2）
+### 7.2 Pack 格式实测（本分支成果，8×910B3, EP8, mbs=1）
 
-| 指标 | 目标 |
-|---|---|
-| **单步耗时** | 4.3-4.5s (降低 10-15%) |
-| **吞吐（WPS）** | 1230-1290 words/s (提升 10-15%) |
-| **AI Core 利用率** | 25-28% (小幅提升) |
-| **HBM 占用** | 55-60GB (维持) |
+> **核心成果**：LLM 序列 pad→pack 改造，消除样本内 padding，原生 FA2 varlen。
+> 详见 [`reports/qwen35_audio_llm_pack_perf_20260616.md`](reports/qwen35_audio_llm_pack_perf_20260616.md)。
+
+**Pack vs Pad 收益（mbs=1, rc_off, 对标 pad1408）**：
+
+| 指标 | Pad 基线 (pad1408) | Pack (mbs=1 rc_off) | 收益 |
+|---|---|---|---|
+| **吞吐（WPS）** | 1158 | **2069** | **+78.6%** |
+| **单步耗时** | 4.79s | 3.79s | **-20.9%** |
+| **HBM 占用** | 54.6 GB | ~40 GB | **−27%** |
+| **Loss 收敛** | 正常 | 正常 (11.85→4.83) | 健康单调下降 ✅ |
+| **训练完成** | 80/80 | 80/80 | 稳定 ✅ |
+
+> WPS 大幅提升原因：pad 基线的 WPS 口径含 padding token，pack 统计的全是真实 token（平均 7663/step），无 padding 浪费。
+
+**实施细节**：
+- 改动：`modeling_qwen3_5_audio.py` forward 支持 pack 检测 + `packed_collator_wrapper.py`（新增）+ `data_collator.py` 注册 `qwen3vl_packed`
+- 环境变量必需：`export AUDIO_PLACEHOLDER="<|AUDIO|>"`（数据预处理校验）
+- collator 配置：`model_name: qwen3vl_packed`
+- attention 配置：`attn_implementation: flash_attention_2`（触发 NPU varlen FA2）
+
+### 7.3 后续优化方向
+
+| 方向 | 预期收益 | 状态 |
+|---|---|---|
+| **Recompute (layer-wise)** | HBM -7GB，WPS -30% | 待实测（`feat/llm-pad-to-pack-recompute` 分支） |
+| **MC2 通信-计算重叠** | WPS +10-15% (1230-1290) | 代码已接通，待与 pack 组合 |
+| **mbs>1** | 理论上更高 batch_tokens | 当前 pack 限制 mbs=1（需 rank 对齐） |
 
 ---
 
@@ -283,7 +335,7 @@ export HCCL_DETERMINISTIC=1
 ## 九、贡献者
 
 - **作者**: Sejin
-- **生成时间**: 2026-06-16
+- **生成时间**: 2026-06-17
 - **框架**: MindSpeed-MM 26.0.0 on Ascend 910B3
 
 ---
@@ -301,5 +353,6 @@ export HCCL_DETERMINISTIC=1
 **快速链接**：
 - [快速开始](QWEN35_AUDIO_TRAINING_GUIDE.md)
 - [项目约束](CLAUDE.md)
+- [Pack 格式验证报告](reports/qwen35_audio_llm_pack_perf_20260616.md)
 - [MoE 优化策略](reports/moe_optimization_strategy_from_blog_20260616.md)
-- [性能调优报告](reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md)
+- [Pad 调优报告](reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md)
