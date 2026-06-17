@@ -4,6 +4,15 @@
 **环境**: 单机 8 卡 Ascend 910B3, CANN 8.5.0, MindSpeed-MM 26.0.0  
 **约束**: 不改模型结构/MoE 路由/专家数量; LoRA-only; 数学一致; HBM 55-60G
 
+**核心成果总览**：
+- **Pack 格式优化**（`feat/llm-pad-to-pack-recompute`）：消除样本内 padding + FA2 varlen，
+  mbs=1 实测 **WPS 2111 (+86% vs pad1133)、HBM 40GB (-31%)**
+- **Pad 格式调优**（`mc2-perf-eval`）：38 轮配置扫描，最优稳定配置 pad1536_nosync **WPS 1133，HBM 56.4GB**
+- **MC2 通信-计算重叠**：代码已接通（`dispatcher: mc2`），预期 WPS +10-15%，待音频 EP8 实测
+- **Recompute 策略**：layer-wise 实测 HBM -7GB（40→33GB），WPS -30%（2111→1475）
+
+详见各分支 README 和 [`reports/`](reports/) 目录。
+
 ---
 
 ## 一、仓库结构
@@ -111,13 +120,16 @@ cd scripts
 
 ## 三、核心文档速查
 
-| 文档 | 用途 |
-|---|---|
-| `CLAUDE.md` | **项目硬约束**（必读）：环境切换、故障处置、优化范围、指标规范 |
-| `QWEN35_AUDIO_TRAINING_GUIDE.md` | 训练快速开始指南 |
-| `STATUS_QWEN35_AUDIO_TRAINING.md` | 当前工作状态&下一步行动 |
-| `reports/moe_optimization_strategy_from_blog_20260616.md` | **MoE 优化策略**（基于博客+实测） |
-| `reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md` | 最新性能调优报告 |
+| 文档 | 用途 | 分支 |
+|---|---|---|
+| `CLAUDE.md` | **项目硬约束**（必读）：环境切换、故障处置、优化范围、指标规范 | 所有分支 |
+| `QWEN35_AUDIO_TRAINING_GUIDE.md` | 训练快速开始指南 | 所有分支 |
+| `STATUS_QWEN35_AUDIO_TRAINING.md` | 当前工作状态&下一步行动 | 所有分支 |
+| **性能验证报告** |
+| [`pack_format_validation_report.md`](https://github.com/Kimsale/qwen3.5_35B_mindspeed/blob/feat/llm-pad-to-pack-recompute/pack_format_validation_report.md) | Pack 格式完整验证（rc_off/rc_on，80步×2） | `feat/llm-pad-to-pack-recompute` |
+| [`reports/qwen35_audio_llm_pack_perf_20260616.md`](https://github.com/Kimsale/qwen3.5_35B_mindspeed/blob/feat/llm-pad-to-pack/reports/qwen35_audio_llm_pack_perf_20260616.md) | Pack 格式初版验证（rc_off 80步） | `feat/llm-pad-to-pack` |
+| [`reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md`](reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md) | Pad 格式 38 轮配置扫描 | `mc2-perf-eval` |
+| [`reports/moe_optimization_strategy_from_blog_20260616.md`](reports/moe_optimization_strategy_from_blog_20260616.md) | MoE 优化策略（含 MC2 状态） | `mc2-perf-eval` |
 
 ---
 
@@ -237,27 +249,48 @@ export HCCL_DETERMINISTIC=1
 
 ---
 
-## 七、性能指标参考
+## 七、性能指标参考（各分支最优配置汇总）
 
-### 基线配置（EP8, mbs=1, ga=4, rc_off, pad1536, nosync, fused）
+### 7.1 Pack 格式（历史最高吞吐，分支：feat/llm-pad-to-pack-recompute）
 
-| 指标 | 值 |
-|---|---|
-| **单步耗时** | 4.89s |
-| **吞吐（WPS）** | 1132 words/s |
-| **AI Core 利用率** | 23.46% (均值), 38.31% (峰值) |
-| **HBM 占用** | 58.77 GB/64GB (96.7%) |
-| **功耗** | 340.32W |
-| **Loss** | 正常收敛，无 NaN |
+| 配置 | WPS | HBM/卡 | 单步耗时 | 状态 | 分支 |
+|------|-----|--------|----------|------|------|
+| **pack mbs=1 rc_off** | **2111** | 40 GB | 3.6s | ✅ 80步稳定 | `feat/llm-pad-to-pack-recompute` |
+| pack mbs=1 rc_on | 1475 | 33 GB | 5.0s | ✅ 80步稳定 | `feat/llm-pad-to-pack-recompute` |
 
-### 优化目标（Phase 1: MC2）
+**Pack vs Pad 收益**（对标 pad1408）：WPS **+82%**，HBM **-27%**，单步 **-25%**
 
-| 指标 | 目标 |
-|---|---|
-| **单步耗时** | 4.3-4.5s (降低 10-15%) |
-| **吞吐（WPS）** | 1230-1290 words/s (提升 10-15%) |
-| **AI Core 利用率** | 25-28% (小幅提升) |
-| **HBM 占用** | 55-60GB (维持) |
+**核心机制**：消除样本内 padding + 原生 FA2 varlen（`npu_flash_attn_varlen_func`），
+position_ids 每样本从 0 重启触发 cu_seqlens 推导。
+
+### 7.2 Pad 格式（最优稳定配置，分支：mc2-perf-eval）
+
+| 配置 | WPS | HBM/卡 | 单步耗时 | 状态 | 分支 |
+|------|-----|--------|----------|------|------|
+| **pad1536_nosync** | 1133 | 56.4 GB | 4.89s | ✅ 80步稳定 | `mc2-perf-eval` |
+| pad1408_nosync | 1158 | 54.6 GB | 4.79s | ✅ 80步稳定 | `mc2-perf-eval` |
+| pad1280_current | 1296 | 51.9 GB | 4.28s | ✅ 80步稳定 | `mc2-perf-eval` |
+
+**说明**：pad1536 严格满足 HBM 55-60GB 目标，经 38 轮配置扫描验证。
+
+### 7.3 MC2 通信-计算重叠（代码已接通，待实测）
+
+**状态**（`mc2-perf-eval` 分支）：
+- ✅ 算子可用（`npu_alltoallv_gmm` / `npu_gmm_alltoallv` in CANN8.5）
+- ✅ 代码接通（`dispatcher: mc2` 支持）
+- ⏳ **音频 EP8 实测待完成**
+
+**预期收益**（理论分析）：WPS 1133 → 1230-1290 (+10-15%)，通过掩盖 forward/backward 的 AllToAll 通信
+
+### 7.4 优化方向矩阵
+
+| 优化方向 | 实测 WPS | HBM | 状态 | 分支 |
+|---------|---------|-----|------|------|
+| Pack rc_off | **2111** | 40 GB | ✅ 已验证 | `feat/llm-pad-to-pack-recompute` |
+| Pack rc_on | 1475 | 33 GB | ✅ 已验证 | `feat/llm-pad-to-pack-recompute` |
+| Pad + MC2 | 1230-1290 (预期) | 55-60 GB | ⏳ 待实测 | `mc2-perf-eval` |
+| **Pack + MC2** | 2320+ (预期) | ~40 GB | 🎯 **最高优先级** | 待组合验证 |
+| Pack mbs>1 | N/A | N/A | ⚠️ 需 rank 对齐 | 待实现 |
 
 ---
 
@@ -283,7 +316,7 @@ export HCCL_DETERMINISTIC=1
 ## 九、贡献者
 
 - **作者**: Sejin
-- **生成时间**: 2026-06-16
+- **生成时间**: 2026-06-17
 - **框架**: MindSpeed-MM 26.0.0 on Ascend 910B3
 
 ---
@@ -301,5 +334,7 @@ export HCCL_DETERMINISTIC=1
 **快速链接**：
 - [快速开始](QWEN35_AUDIO_TRAINING_GUIDE.md)
 - [项目约束](CLAUDE.md)
-- [MoE 优化策略](reports/moe_optimization_strategy_from_blog_20260616.md)
-- [性能调优报告](reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md)
+- **分支成果：**
+  - [Pack 格式完整验证](https://github.com/Kimsale/qwen3.5_35B_mindspeed/blob/feat/llm-pad-to-pack-recompute/pack_format_validation_report.md)（`feat/llm-pad-to-pack-recompute`）
+  - [Pad 调优 38 轮扫描](reports/qwen35_audio_manual_ep8_perf_tuning_20260616.md)（`mc2-perf-eval`）
+  - [MoE 优化策略（含 MC2）](reports/moe_optimization_strategy_from_blog_20260616.md)（`mc2-perf-eval`）
