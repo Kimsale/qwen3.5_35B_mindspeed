@@ -1,4 +1,5 @@
 from typing import Optional
+import time
 
 import torch
 import torch.nn.functional as F
@@ -58,9 +59,17 @@ class TransformersModel(MultiModalModule):
         self._set_loss_cfg(args)
         
         if callable(getattr(model_cls, 'overwrite_transformer_config', None)):
-            self.transformer_config = model_cls.overwrite_transformer_config(self.transformer_config)
+            try:
+                self.transformer_config = model_cls.overwrite_transformer_config(
+                    self.transformer_config, args.mm.model
+                )
+            except TypeError:
+                self.transformer_config = model_cls.overwrite_transformer_config(self.transformer_config)
 
-        if args.init_model_with_meta_device:
+        needs_audio_weights = callable(getattr(model_cls, "load_whisper_encoder", None))
+        load_start = time.time()
+        print_rank_0(f"> model load start: needs_audio_weights={needs_audio_weights}, meta={args.init_model_with_meta_device}")
+        if args.init_model_with_meta_device and not needs_audio_weights:
             self.model = model_cls._from_config(self.transformer_config).float()
             for m in self.model.modules():
                 if getattr(m, "_is_hf_initialized", False):
@@ -72,16 +81,33 @@ class TransformersModel(MultiModalModule):
                 dtype=torch.float32,
                 low_cpu_mem_usage=True,
                 device_map="cpu",
+                ignore_mismatched_sizes=getattr(args.mm.model, "ignore_mismatched_sizes", False),
                 trust_remote_code=trust_remote_code
             )
-        print_rank_0("> load model successfully")
+        print_rank_0(f"> load model successfully in {time.time() - load_start:.3f}s")
 
+        train_start = time.time()
         self.model.train()
+        print_rank_0(f"> model.train() finished in {time.time() - train_start:.3f}s")
 
         if callable(getattr(self.model, 'freeze', None)):
+            freeze_start = time.time()
             self.model.freeze(config)
+            print_rank_0(f"> model.freeze() finished in {time.time() - freeze_start:.3f}s")
 
         self.model.use_cache = False
+
+        if callable(getattr(self.model, "load_whisper_encoder", None)):
+            whisper_start = time.time()
+            print_rank_0("> load_whisper_encoder start")
+            self.model.load_whisper_encoder(dtype=torch.float32)
+            print_rank_0(f"> load_whisper_encoder finished in {time.time() - whisper_start:.3f}s")
+
+        meta_param_count, meta_buffer_count = self._materialize_remaining_meta_tensors()
+        if meta_param_count or meta_buffer_count:
+            print_rank_0(
+                f"> materialized remaining meta tensors: params={meta_param_count}, buffers={meta_buffer_count}"
+            )
 
     def forward(
             self,
@@ -148,11 +174,16 @@ class TransformersModel(MultiModalModule):
     ):
         # If the model has its own 'fully_shard' method, use it directly
         if hasattr(self.model, 'fully_shard') and callable(getattr(self.model, 'fully_shard')):
-            return self.model.fully_shard(
+            print_rank_0(f"> fully_shard start: process_group={process_group}")
+            shard_start = time.time()
+            result = self.model.fully_shard(
                 process_group=process_group,
                 fsdp2_config_path=fsdp2_config_path,
                 **kwargs
             )
+            print_rank_0(f"> fully_shard finished in {time.time() - shard_start:.3f}s")
+            return result
+        print_rank_0("> fully_shard skipped, model has no custom implementation")
         return False
 
     def calculate_chunk_size(self, batch_size: int, total_size: int) -> int:
@@ -187,6 +218,43 @@ class TransformersModel(MultiModalModule):
             max_power_of_two_chunk_size = max_power_of_two_chunk_size >> 1  # Right shift by 1 bit = divide by 2
 
         return max_power_of_two_chunk_size
+
+    def _materialize_remaining_meta_tensors(self) -> tuple[int, int]:
+        """Replace any leftover meta tensors with real CPU tensors before PEFT wrapping.
+
+        The legacy meta-device loading path can leave a small number of tensors unmaterialized
+        after custom model construction. PEFT/Lora injection cannot operate on meta tensors,
+        so we force any leftovers onto CPU here. These tensors are only expected to be either
+        newly added modules or frozen branches that are not used before later loading.
+        """
+        meta_param_count = 0
+        meta_buffer_count = 0
+
+        def _get_parent_module(root: torch.nn.Module, name: str) -> tuple[torch.nn.Module, str]:
+            if "." not in name:
+                return root, name
+            parent_name, leaf_name = name.rsplit(".", 1)
+            return root.get_submodule(parent_name), leaf_name
+
+        # named_parameters / named_buffers give us the complete registered tree, including
+        # nested wrappers that may be missed when only inspecting module._parameters.
+        for param_name, param in list(self.model.named_parameters(recurse=True)):
+            if param is None or not getattr(param, "is_meta", False):
+                continue
+            parent_module, leaf_name = _get_parent_module(self.model, param_name)
+            parent_module._parameters[leaf_name] = torch.nn.Parameter(
+                torch.zeros_like(param, device="cpu"), requires_grad=param.requires_grad
+            )
+            meta_param_count += 1
+
+        for buffer_name, buffer in list(self.model.named_buffers(recurse=True)):
+            if buffer is None or not getattr(buffer, "is_meta", False):
+                continue
+            parent_module, leaf_name = _get_parent_module(self.model, buffer_name)
+            parent_module._buffers[leaf_name] = torch.zeros_like(buffer, device="cpu")
+            meta_buffer_count += 1
+
+        return meta_param_count, meta_buffer_count
 
     def build_loss_ctx(
         self,

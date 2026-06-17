@@ -1132,8 +1132,16 @@ class Qwen3_5MoePreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         super()._init_weights(module)
         if isinstance(module, Qwen3_5MoeGatedDeltaNet):
-            init.ones_(module.dt_bias)
-            init.copy_(module.A_log, torch.empty_like(module.A_log).uniform_(0, 16).log_())
+            dt_bias = torch.ones(module.num_v_heads, dtype=module.dt_bias.dtype, device="cpu")
+            a_log = torch.empty(module.num_v_heads, dtype=module.A_log.dtype, device="cpu").uniform_(0, 16).log_()
+            if module.dt_bias.is_meta:
+                module.dt_bias = nn.Parameter(dt_bias)
+            else:
+                init.ones_(module.dt_bias)
+            if module.A_log.is_meta:
+                module.A_log = nn.Parameter(a_log)
+            else:
+                init.copy_(module.A_log, a_log)
         # We initialize with 0s to be 1 centered as the RMSNorm here does (1 + weight)
         elif isinstance(module, Qwen3_5MoeRMSNorm):
             init.zeros_(module.weight)
@@ -1143,8 +1151,14 @@ class Qwen3_5MoePreTrainedModel(PreTrainedModel):
         elif isinstance(module, Qwen3_5MoeSparseMoeBlock):
             init.normal_(module.gate.weight, mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, Qwen3_5MoeVisionRotaryEmbedding):
-            inv_freq = 1.0 / (module.theta ** (torch.arange(0, module.dim, 2, dtype=torch.float) / module.dim))
-            init.copy_(module.inv_freq, inv_freq)
+            inv_freq = 1.0 / (
+                module.theta
+                ** (torch.arange(0, module.dim, 2, dtype=torch.float, device="cpu") / module.dim)
+            )
+            if module.inv_freq.is_meta:
+                module.register_buffer("inv_freq", inv_freq, persistent=False)
+            else:
+                init.copy_(module.inv_freq, inv_freq)
 
 
 class Qwen3_5MoeVisionMLP(nn.Module):
@@ -2644,8 +2658,6 @@ __all__ = [
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3_5MoePreTrainedModel",
 ]
-
-
 
 
 

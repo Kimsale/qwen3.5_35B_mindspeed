@@ -42,7 +42,6 @@ from megatron.training.utils import average_losses_across_data_parallel_group, u
 from mindspeed_mm.configs.config import mm_extra_args_provider
 from mindspeed_mm.data import build_mm_dataloader, build_mm_dataset
 from mindspeed_mm.data.data_utils.utils import build_iterations, cal_gradient_accumulation_size
-from mindspeed_mm.data.data_utils.constants import AVG_PER_STEP_TOKEN_NUM, GLOBAL_STEP_TOKEN_NUM
 from mindspeed_mm.data.dataloader.dataloader import PrefetchGradAccDataLoader
 from mindspeed_mm.data.dataloader.dynamic_batching_dataloader import DynamicBatchingDataLoader
 from mindspeed_mm.training import pretrain
@@ -56,7 +55,7 @@ if hasattr(mindspeed_args, "ai_framework") and mindspeed_args.ai_framework == "m
 def model_provider(*args, **kwargs):
     """Builds the model."""
     args = get_args()
-    print_rank_0("building VLMModel ...")
+    print_rank_0("building Transformers model ...")
     vlm_config = deepcopy(args.mm.model)
     model = TransformersModel(vlm_config)
 
@@ -64,19 +63,21 @@ def model_provider(*args, **kwargs):
 
 
 def move_to_device(batch: Dict[str, Any], float_dtype: str):
-    """Move batch tensors to current device with given float dtype."""
+    """Move every tensor in a batch to the current device."""
     new_batch = dict()
     for k, v in batch.items():
-        if k in [AVG_PER_STEP_TOKEN_NUM, GLOBAL_STEP_TOKEN_NUM]:
-            new_batch[k] = v.to(device=torch.cuda.current_device())
-        elif isinstance(v, torch.Tensor):
+        if isinstance(v, torch.Tensor):
             dtype = float_dtype if torch.is_floating_point(v) else None
             new_batch[k] = v.to(device=torch.cuda.current_device(), dtype=dtype)
         elif isinstance(v, list) and all(isinstance(t, torch.Tensor) for t in v):
-            new_batch[k] = [t.to(device=torch.cuda.current_device(),
-                             dtype=float_dtype if torch.is_floating_point(t) else None)
-                        for t in v]
-        elif isinstance(v, (bool, int, float, str)) or v is None:
+            new_batch[k] = [
+                t.to(
+                    device=torch.cuda.current_device(),
+                    dtype=float_dtype if torch.is_floating_point(t) else None,
+                )
+                for t in v
+            ]
+        else:
             new_batch[k] = v
     return new_batch
 

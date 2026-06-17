@@ -973,7 +973,10 @@ class Qwen3_5PreTrainedModel(PreTrainedModel):
         elif isinstance(module, Qwen3_5RMSNorm):
             init.zeros_(module.weight)
         elif isinstance(module, Qwen3_5VisionRotaryEmbedding):
-            inv_freq = 1.0 / (module.theta ** (torch.arange(0, module.dim, 2, dtype=torch.float) / module.dim))
+            inv_freq = 1.0 / (
+                module.theta
+                ** (torch.arange(0, module.dim, 2, dtype=torch.float, device="cpu") / module.dim)
+            )
             init.copy_(module.inv_freq, inv_freq)
 
 

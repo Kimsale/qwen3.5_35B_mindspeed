@@ -28,9 +28,11 @@
 """
 
 from typing import Optional
+from pathlib import Path
 
 import torch
 from torch import nn
+from safetensors import safe_open
 from transformers.models.whisper.modeling_whisper import WhisperEncoder
 from transformers.models.whisper.configuration_whisper import WhisperConfig
 
@@ -88,14 +90,22 @@ class WhisperAudioTower(nn.Module):
         只加载 encoder 子模块的权重，decoder 权重会被忽略。
         """
         config = WhisperConfig.from_pretrained(whisper_path)
-        module = cls(config)
-        # 用 from_pretrained 把完整 whisper 权重载入临时模型，再抽 encoder。
-        full = WhisperEncoder.from_pretrained(
-            whisper_path,
-            config=config,
-            dtype=dtype,
-        )
-        missing, unexpected = module.encoder.load_state_dict(full.state_dict(), strict=False)
+        module = cls(config).to_empty(device="cpu")
+
+        # 训练入口会在 meta-device 上构建主模型，因此这里不能再嵌套调用
+        # WhisperEncoder.from_pretrained()。直接读取 checkpoint 并只保留 encoder 权重即可。
+        ckpt_file = Path(whisper_path) / "model.safetensors"
+        state_dict = {}
+        if ckpt_file.is_file():
+            with safe_open(str(ckpt_file), framework="pt", device="cpu") as f:
+                prefix = "model.encoder."
+                for key in f.keys():
+                    if key.startswith(prefix):
+                        state_dict[key.removeprefix(prefix)] = f.get_tensor(key).to(dtype)
+        else:
+            raise FileNotFoundError(f"Whisper checkpoint not found: {ckpt_file}")
+
+        missing, unexpected = module.encoder.load_state_dict(state_dict, strict=False)
         print_rank(
             logger.info,
             f"[WhisperAudioTower] loaded encoder from {whisper_path}; "

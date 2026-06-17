@@ -69,6 +69,29 @@ def model_provider_func_wrapper(model_provider_func):
             import torch.nn as nn
             import math
 
+            def _materialize_base_layer_if_meta(base_layer):
+                has_meta = any(getattr(param, "is_meta", False) for param in base_layer.parameters(recurse=True))
+                has_meta = has_meta or any(getattr(buffer, "is_meta", False) for buffer in base_layer.buffers(recurse=True))
+                if not has_meta:
+                    return False
+                print(f"> materializing meta base layer before LoRA injection: {type(base_layer).__name__}", flush=True)
+                if hasattr(base_layer, "to_empty"):
+                    base_layer.to_empty(device="cpu")
+                else:
+                    for param_name, param in list(base_layer.named_parameters(recurse=True)):
+                        if getattr(param, "is_meta", False):
+                            parent_name, leaf_name = param_name.rsplit(".", 1) if "." in param_name else ("", param_name)
+                            parent_module = base_layer.get_submodule(parent_name) if parent_name else base_layer
+                            parent_module._parameters[leaf_name] = nn.Parameter(
+                                torch.zeros_like(param, device="cpu"), requires_grad=param.requires_grad
+                            )
+                    for buffer_name, buffer in list(base_layer.named_buffers(recurse=True)):
+                        if getattr(buffer, "is_meta", False):
+                            parent_name, leaf_name = buffer_name.rsplit(".", 1) if "." in buffer_name else ("", buffer_name)
+                            parent_module = base_layer.get_submodule(parent_name) if parent_name else base_layer
+                            parent_module._buffers[leaf_name] = torch.zeros_like(buffer, device="cpu")
+                return True
+
             def safe_reset_lora_parameters(self, adapter_name, init_lora_weights):
                 if init_lora_weights is False:
                     return
@@ -84,6 +107,104 @@ def model_provider_func_wrapper(model_provider_func):
                     nn.init.zeros_(self.lora_embedding_A[adapter_name])
                     nn.init.normal_(self.lora_embedding_B[adapter_name])
             LoraLayer.reset_lora_parameters = safe_reset_lora_parameters
+
+            def safe_update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+                _materialize_base_layer_if_meta(self.get_base_layer())
+                if r <= 0:
+                    raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
+                self.r[adapter_name] = r
+                self.lora_alpha[adapter_name] = lora_alpha
+                if lora_dropout > 0.0:
+                    lora_dropout_layer = nn.Dropout(p=lora_dropout)
+                else:
+                    lora_dropout_layer = nn.Identity()
+
+                self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
+                if r > 0:
+                    self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
+                    self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
+                    self.scaling[adapter_name] = lora_alpha / r
+
+                if init_lora_weights == "loftq":
+                    self.loftq_init(adapter_name)
+                elif init_lora_weights:
+                    self.reset_lora_parameters(adapter_name, init_lora_weights)
+                self.set_adapter(self.active_adapters)
+
+            def safe_update_layer_conv2d(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+                _materialize_base_layer_if_meta(self.get_base_layer())
+                if r <= 0:
+                    raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
+                self.r[adapter_name] = r
+                self.lora_alpha[adapter_name] = lora_alpha
+                if lora_dropout > 0.0:
+                    lora_dropout_layer = nn.Dropout(p=lora_dropout)
+                else:
+                    lora_dropout_layer = nn.Identity()
+
+                self.lora_dropout[adapter_name] = lora_dropout_layer
+                base_layer = self.get_base_layer()
+                if r > 0:
+                    kernel_size = base_layer.kernel_size
+                    stride = base_layer.stride
+                    padding = base_layer.padding
+                    self.lora_A[adapter_name] = nn.Conv2d(self.in_features, r, kernel_size, stride, padding, bias=False)
+                    self.lora_B[adapter_name] = nn.Conv2d(r, self.out_features, (1, 1), (1, 1), bias=False)
+                    self.scaling[adapter_name] = lora_alpha / r
+
+                if init_lora_weights == "loftq":
+                    self.loftq_init(adapter_name)
+                elif init_lora_weights:
+                    self.reset_lora_parameters(adapter_name, init_lora_weights)
+                self.set_adapter(self.active_adapters)
+
+            def safe_update_layer_embedding(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+                _materialize_base_layer_if_meta(self.get_base_layer())
+                if r <= 0:
+                    raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
+                self.r[adapter_name] = r
+                self.lora_alpha[adapter_name] = lora_alpha
+                if lora_dropout > 0.0:
+                    lora_dropout_layer = nn.Dropout(p=lora_dropout)
+                else:
+                    lora_dropout_layer = nn.Identity()
+
+                self.lora_dropout[adapter_name] = lora_dropout_layer
+                if r > 0:
+                    weight_A = torch.randn((r, self.in_features))
+                    weight_B = torch.randn((self.out_features, r))
+                    self.lora_embedding_A[adapter_name] = nn.Parameter(weight_A)
+                    self.lora_embedding_B[adapter_name] = nn.Parameter(weight_B)
+                    self.scaling[adapter_name] = lora_alpha / r
+
+                if init_lora_weights == "loftq":
+                    self.loftq_init(adapter_name)
+                elif init_lora_weights:
+                    self.reset_lora_parameters(adapter_name, init_lora_weights)
+                self.set_adapter(self.active_adapters)
+
+            LoraLayer.update_layer = safe_update_layer
+            LoraLayer.update_layer_conv2d = safe_update_layer_conv2d
+            LoraLayer.update_layer_embedding = safe_update_layer_embedding
+
+            def safe_replace_module(self, parent, target_name, new_module, target):
+                if hasattr(target, "base_layer"):
+                    target = target.base_layer
+
+                if not hasattr(new_module, "base_layer"):
+                    new_module.weight = target.weight
+                    if hasattr(target, "bias"):
+                        new_module.bias = target.bias
+
+                if getattr(target, "state", None) is not None:
+                    if hasattr(new_module, "base_layer"):
+                        new_module.base_layer.state = target.state
+                    else:
+                        new_module.state = target.state
+
+                setattr(parent, target_name, new_module)
+
+            LoraModel._replace_module = safe_replace_module
 
             def safe_get_tied_target_modules(self, model):
                 tied = []
@@ -129,6 +250,41 @@ def model_provider_func_wrapper(model_provider_func):
             if not trainable_target_modules:
                 return model
             lora_config.target_modules = trainable_target_modules
+
+            meta_targets = []
+
+            def _list_meta_tensors(module):
+                meta_params = [name for name, param in module.named_parameters(recurse=True) if getattr(param, "is_meta", False)]
+                meta_buffers = [name for name, buffer in module.named_buffers(recurse=True) if getattr(buffer, "is_meta", False)]
+                return meta_params, meta_buffers
+
+            for module_name in trainable_target_modules:
+                try:
+                    target_module = model.get_submodule(module_name)
+                except AttributeError:
+                    continue
+                meta_params, meta_buffers = _list_meta_tensors(target_module)
+                if meta_params or meta_buffers:
+                    meta_targets.append(module_name)
+                    if hasattr(target_module, "to_empty"):
+                        target_module.to_empty(device="cpu")
+                    else:
+                        for param_name in meta_params:
+                            parent_name, leaf_name = param_name.rsplit(".", 1) if "." in param_name else ("", param_name)
+                            parent_module = target_module.get_submodule(parent_name) if parent_name else target_module
+                            param = getattr(parent_module, leaf_name)
+                            parent_module._parameters[leaf_name] = torch.nn.Parameter(
+                                torch.zeros_like(param, device="cpu"),
+                                requires_grad=param.requires_grad,
+                            )
+                        for buffer_name in meta_buffers:
+                            parent_name, leaf_name = buffer_name.rsplit(".", 1) if "." in buffer_name else ("", buffer_name)
+                            parent_module = target_module.get_submodule(parent_name) if parent_name else target_module
+                            buffer = getattr(parent_module, leaf_name)
+                            parent_module._buffers[leaf_name] = torch.zeros_like(buffer, device="cpu")
+
+            if meta_targets:
+                print(f"> materialized meta LoRA targets: {meta_targets}", flush=True)
 
             model = get_peft_model(model, lora_config)
             model.add_module('module', model.get_base_model())

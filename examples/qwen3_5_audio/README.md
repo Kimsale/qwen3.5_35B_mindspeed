@@ -6,6 +6,22 @@ Qwen3.5-35B-A3B（linear+full 混合注意力 MoE 文本塔）上，做"语音 w
 
 > 严格遵循项目约束：全程锁定 **CANN 8.5**，禁用 CANN 8.1；不引入 GPU/CUDA 方案。
 
+## 当前状态
+
+这条分支已经把 pack 版迁移、legacy zero2 迁移、recompute 尝试和 meta tensor 清理都跑过一轮。
+
+- `from_pretrained()` 的 meta 初始化卡点已经收掉
+- Whisper encoder 的 nested load 已经收掉
+- LoRA / PEFT 的 meta tensor 注入问题已经收掉
+- `custom_fsdp` 的 `TransformerEngineBaseModule` `NameError` 已经补掉
+- 但是 `legacy zero2 + custom_fsdp` 仍在 `ParamAndGradBuffer` 初始化阶段 OOM
+- `nofsdp` 仍会在 optimizer 初始化时碰到残余 `torch.meta.BFloat16Tensor`
+- 截至目前，训练还没有真正进入首个 iteration
+
+完整尝试记录和日志索引见：
+
+- [`legacy_zero2_migration_report.md`](/data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/legacy_zero2_migration_report.md)
+
 ---
 
 ## 一、架构
@@ -126,9 +142,48 @@ key 前缀（`audio_tower.* / audio_projector.*`）单独提取即可。
 - `librosa`（音频读取重采样）
 - Whisper-large-v3 权重（128-mel 版本）
 
+## 五点五、迁移追踪
+
+这部分是当前分支最重要的上下文，方便在别的机器上直接复现判断。
+
+### 已尝试的路径
+
+| 路径 | 结果 |
+|---|---|
+| 原始 pack + legacy zero2 | 卡在 `from_pretrained()` 的 meta 初始化链路 |
+| pack + nofsdp | 能加载模型和 LoRA，但 optimizer 初始化仍遇到 meta 参数 |
+| pack + legacy zero2 + `TransformerEngineBaseModule` fallback | 通过模型加载和 LoRA 注入，但在 `ParamAndGradBuffer` 初始化时 OOM |
+
+### 已做的修复
+
+- [`mindspeed_mm/fsdp/models/qwen3_5_audio/modeling_qwen3_5_audio.py`](/data/sejin/third_party/mindspeed-mm-26.0.0/mindspeed_mm/fsdp/models/qwen3_5_audio/modeling_qwen3_5_audio.py)
+  - `initialize_weights()` fast-path，只初始化新增 `audio_projector`
+- [`mindspeed_mm/fsdp/models/qwen3_5_audio/whisper_encoder.py`](/data/sejin/third_party/mindspeed-mm-26.0.0/mindspeed_mm/fsdp/models/qwen3_5_audio/whisper_encoder.py)
+  - 直接从 `model.safetensors` 装 Whisper encoder，避免嵌套 `from_pretrained()`
+- [`mindspeed_mm/models/transformers_model.py`](/data/sejin/third_party/mindspeed-mm-26.0.0/mindspeed_mm/models/transformers_model.py)
+  - 递归实体化残余 meta tensor
+- [`mindspeed_mm/tasks/finetune/lora/lora_patch.py`](/data/sejin/third_party/mindspeed-mm-26.0.0/mindspeed_mm/tasks/finetune/lora/lora_patch.py)
+  - 递归扫描 LoRA 目标
+  - 规避 PEFT 在 meta tensor 上的 `.to()` 行为
+- [`/data/sejin/third_party/Megatron-LM-core_v0.12.1/megatron/core/distributed/custom_fsdp/param_and_grad_buffer.py`](/data/sejin/third_party/Megatron-LM-core_v0.12.1/megatron/core/distributed/custom_fsdp/param_and_grad_buffer.py)
+  - 补 `TransformerEngineBaseModule` fallback，避免 TE 未安装时直接 `NameError`
+
+### 结果日志
+
+- [`qwen3_5_audio_legacy_zero2_after_nameerror_fix_20260617_114723.log`](/data/sejin/baseline_26/logs/qwen3_5_audio_legacy_zero2_after_nameerror_fix_20260617_114723.log)
+  - 通过了前序加载和 LoRA 注入
+  - 在 `ParamAndGradBuffer._init_each_parameter_group_buffers()` 时 OOM
+- [`qwen3_5_audio_meta_fix_nofsdp_smoke_20260617_114121.log`](/data/sejin/baseline_26/logs/qwen3_5_audio_meta_fix_nofsdp_smoke_20260617_114121.log)
+  - 模型和 LoRA 能走完
+  - optimizer 初始化时仍遇到残余 meta 参数
+
+### 结论
+
+当前更现实的方向仍然是继续沿 `legacy zero2` 收 buffer / 参数初始化问题，而不是继续在 `nofsdp` 上硬绕。
+
 ---
 
-## 五点五、对框架的两处必要改动（已落地）
+## 五点六、对框架的两处必要改动（已落地）
 Qwen3.5 的 `AutoProcessor` 是 **vision-only**（`Qwen3VLProcessor`，无 `feature_extractor`），
 而数据侧 `Qwen2OmniPlugin` 需要它把 wav 转 mel 谱。为此对数据栈做了**向后兼容**的小改：
 
@@ -142,7 +197,7 @@ Qwen3.5 的 `AutoProcessor` 是 **vision-only**（`Qwen3VLProcessor`，无 `feat
 
 ---
 
-## 六、数学一致性声明
+## 七、数学一致性声明
 - 未改动 Qwen3.5 MoE 网络结构、专家数、路由规则；仅新增冻结的 audio encoder、
   可训 projector、LoRA 适配器。
 - 音频特征通过 `masked_scatter` 注入文本序列的 `<|audio_pad|>` 占位处，未改动

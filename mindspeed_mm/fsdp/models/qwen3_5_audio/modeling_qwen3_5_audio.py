@@ -39,6 +39,7 @@
 """
 
 import logging
+import time
 from typing import Optional
 
 import torch
@@ -124,6 +125,26 @@ class Qwen3_5AudioForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
         self.audio_tower.load_state_dict(loaded.state_dict())
         print_rank(logger.info, f"[Qwen3_5Audio] whisper encoder 权重已从 {self._whisper_path} 载入")
 
+    def initialize_weights(self):
+        """Fast-path initialization for the composite audio model.
+
+        The default HF implementation walks the full multimodal module tree. On this legacy
+        pack path that turns into a very expensive traversal after checkpoint loading, while
+        only the newly introduced trainable audio projector really needs local initialization
+        here. Base text / vision weights are already loaded from the checkpoint, and the
+        Whisper tower is populated later by ``load_whisper_encoder()``.
+        """
+        if not hasattr(self, "audio_projector"):
+            return super().initialize_weights()
+
+        init_start = time.time()
+        print_rank(logger.info, "[Qwen3_5Audio] initialize_weights fast-path start: audio_projector only")
+        self.audio_projector.apply(self._initialize_weights)
+        print_rank(
+            logger.info,
+            f"[Qwen3_5Audio] initialize_weights fast-path finished in {time.time() - init_start:.3f}s",
+        )
+
     def _get_audio_features(
         self,
         input_features: torch.FloatTensor,
@@ -169,29 +190,66 @@ class Qwen3_5AudioForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
         video_grid_thw: torch.LongTensor = None,
         cache_position: torch.LongTensor = None,
         logits_to_keep=0,
+        cu_seqlens: torch.LongTensor = None,  # Pack format: cumulative sequence lengths
         **kwargs,
     ):
+        """Forward supporting both Pack and Pad formats.
+
+        Pack format (when cu_seqlens is provided):
+          - input_ids: (1, total_len) — packed sequence with leading batch dim (set by collator)
+          - position_ids: (1, total_len) — per-sample independent position IDs (reset per sample)
+          - labels: (1, total_len) — packed labels with leading batch dim
+          - cu_seqlens: (batch_size+1,) — cumulative lengths [0, len1, len1+len2, ...]
+          - attention_mask: None (triggers native FA2 varlen path via position_ids resets)
+
+        Pad format (legacy, when cu_seqlens is None):
+          - input_ids: (batch_size, max_len) padded
+          - attention_mask: (batch_size, max_len)
+          - position_ids: auto-generated or provided
+        """
+        # Detect pack vs pad format
+        is_packed = cu_seqlens is not None
+
+        # Pack format: enforce attention_mask=None so transformers routes to FA2 varlen
+        # via position_ids (the _is_packed_sequence detection in modeling_flash_attention_utils).
+        if is_packed:
+            attention_mask = None
+
         # 先取文本 embedding，再把音频特征 scatter 进 <|audio_pad|> 位置。
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
+            # Shape after embed:
+            #   pack: (1, total_len, hidden)   — collator already added batch dim
+            #   pad:  (batch, seq_len, hidden) — original 2D input_ids -> 3D embeds
 
         if input_features is not None:
             audio_embeds = self._get_audio_features(input_features, feature_attention_mask)
             audio_embeds = audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
 
-            audio_mask = (input_ids == self.audio_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-            n_audio_pos = audio_mask[..., 0].sum()
-            if n_audio_pos != audio_embeds.shape[0]:
-                raise ValueError(
-                    f"音频 token 数不匹配：input_ids 中 <|audio_pad|> 有 {n_audio_pos} 个，"
-                    f"但 projector 产出 {audio_embeds.shape[0]} 个向量。请检查下采样公式一致性。"
+            if is_packed:
+                # Pack format: replace audio tokens sample-by-sample using cu_seqlens boundaries.
+                # Both input_ids and inputs_embeds carry leading batch dim of size 1.
+                inputs_embeds = self._replace_audio_tokens_packed(
+                    inputs_embeds, audio_embeds, input_ids, cu_seqlens
                 )
-            inputs_embeds = inputs_embeds.masked_scatter(
-                audio_mask.to(inputs_embeds.device), audio_embeds
-            )
+            else:
+                # Pad format: original masked_scatter logic
+                audio_mask = (input_ids == self.audio_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                n_audio_pos = audio_mask[..., 0].sum()
+                if n_audio_pos != audio_embeds.shape[0]:
+                    raise ValueError(
+                        f"音频 token 数不匹配：input_ids 中 <|audio_pad|> 有 {n_audio_pos} 个，"
+                        f"但 projector 产出 {audio_embeds.shape[0]} 个向量。请检查下采样公式一致性。"
+                    )
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    audio_mask.to(inputs_embeds.device), audio_embeds
+                )
 
         # 委托父类：input_ids 置 None（与 inputs_embeds 互斥），保留全部 loss 逻辑。
         # 不传 pixel_values/grid_thw，即关闭视觉分支。
+        # Pack format reaches here with shapes:
+        #   inputs_embeds: (1, total_len, hidden), position_ids/labels: (1, total_len),
+        #   attention_mask: None — triggers FA2 varlen via position_ids resets.
         return super().forward(
             input_ids=None,
             attention_mask=attention_mask,
@@ -203,3 +261,46 @@ class Qwen3_5AudioForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
             logits_to_keep=logits_to_keep,
             **kwargs,
         )
+
+    def _replace_audio_tokens_packed(
+        self,
+        inputs_embeds: torch.Tensor,  # (1, total_len, hidden)
+        audio_embeds: torch.Tensor,   # (total_audio_tokens, hidden)
+        input_ids: torch.Tensor,      # (1, total_len)
+        cu_seqlens: torch.Tensor,     # (batch_size+1,)
+    ) -> torch.Tensor:
+        """Replace audio tokens in pack format, sample by sample via cu_seqlens.
+
+        Operates on tensors that carry a leading batch dim of size 1 (set by collator),
+        which the framework expects throughout. We index via [0, start:end] so the
+        output retains the batch dim for downstream FSDP/loss handling.
+        """
+        batch_size = len(cu_seqlens) - 1
+        audio_offset = 0
+
+        for b in range(batch_size):
+            start = cu_seqlens[b].item()
+            end = cu_seqlens[b + 1].item()
+            sample_ids = input_ids[0, start:end]               # (sample_len,)
+            sample_embeds = inputs_embeds[0, start:end]        # (sample_len, hidden)
+
+            audio_positions = (sample_ids == self.audio_token_id).nonzero(as_tuple=True)[0]
+            n_audio = len(audio_positions)
+
+            if n_audio > 0:
+                sample_audio = audio_embeds[audio_offset : audio_offset + n_audio]
+                if sample_audio.shape[0] != n_audio:
+                    raise ValueError(
+                        f"Sample {b}: audio token count mismatch. "
+                        f"input_ids has {n_audio} <|audio_pad|>, but audio_embeds provides {sample_audio.shape[0]}."
+                    )
+                sample_embeds[audio_positions] = sample_audio
+                inputs_embeds[0, start:end] = sample_embeds
+                audio_offset += n_audio
+
+        if audio_offset != audio_embeds.shape[0]:
+            raise ValueError(
+                f"Total audio token mismatch: processed {audio_offset}, but audio_embeds has {audio_embeds.shape[0]}."
+            )
+
+        return inputs_embeds
