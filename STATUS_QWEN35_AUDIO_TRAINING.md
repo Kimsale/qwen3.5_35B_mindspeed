@@ -176,11 +176,29 @@ parallel:
 ---
 
 
-### 失败尝试（已归档）
-- `feat/llm-pad-to-pack-legacy-zero2`: Legacy ZeRO2 迁移（ParamAndGradBuffer OOM，已放弃）
-  - 位置: MindSpeed-MM 源码仓库 `/data/sejin/third_party/mindspeed-mm-26.0.0`
-  - Tag: [v-legacy-zero2-failed](https://github.com/Kimsale/qwen3.5_35B_mindspeed/releases/tag/v-legacy-zero2-failed)
-  - 文档: `examples/qwen3_5_audio/HANDOFF_BRIEF.md`, `legacy_zero2_migration_report.md`
+### 失败尝试/负向结果（已归档）
+
+#### 1. Legacy ZeRO2 迁移 ❌
+- **分支**: `feat/llm-pad-to-pack-legacy-zero2`
+- **位置**: MindSpeed-MM 源码仓库 `/data/sejin/third_party/mindspeed-mm-26.0.0`
+- **目标**: 将 pack 从 FSDP2 切换到 legacy ZeRO2 + custom_fsdp
+- **结果**: ParamAndGradBuffer OOM，optimizer meta tensor 残留，未进入首个 iteration
+- **结论**: 已放弃，继续使用 pack + FSDP2 mbs=1 (WPS 2111)
+- **Tag**: [v-legacy-zero2-failed](https://github.com/Kimsale/qwen3.5_35B_mindspeed/releases/tag/v-legacy-zero2-failed)
+- **文档**: `examples/qwen3_5_audio/HANDOFF_BRIEF.md`, `legacy_zero2_migration_report.md`
+
+#### 2. Pipeline Experts Overlap ⚠️
+- **分支**: `feat/qwen35-audio-pipeline-experts-overlap`
+- **位置**: MindSpeed-MM 源码仓库 `/data/sejin/third_party/mindspeed-mm-pipeline-experts-overlap`
+- **目标**: MoE EP dispatch/combine 支持 chunk + 多 stream 异步 AllToAll，专家计算流水化
+- **结果**: ✅ 80/80 步稳定完成，但 WPS 645.5（仅为 pack 基线的 30.6%）
+- **根因**: mbs=1 下每专家 token 太少，chunk 后专家 GEMM 更小，通信等待未被计算覆盖
+- **结论**: 性能回退 -69.4%，不建议替换 pack 基线，保留为实验分支
+- **对比**: Pack rc_off (WPS 2111, 3.6s/step, 40GB) vs Pipeline (WPS 645, 8.6s/step, 56.6GB)
+- **GitHub**: https://github.com/Kimsale/qwen3.5_35B_mindspeed/tree/feat/qwen35-audio-pipeline-experts-overlap
+- **报告**: 
+  - [分支总结](https://github.com/Kimsale/qwen3.5_35B_mindspeed/blob/feat/qwen35-audio-pipeline-experts-overlap/qwen35_audio_artifacts/reports/qwen35_audio_pipeline_branch_summary_20260617.md)
+  - [性能报告](https://github.com/Kimsale/qwen3.5_35B_mindspeed/blob/feat/qwen35-audio-pipeline-experts-overlap/qwen35_audio_artifacts/reports/qwen35_audio_pipeline_experts_overlap_20260617.md)
 
 ---
 
