@@ -35,6 +35,9 @@ class ModelHub:
         if model_cls is None:
             raise ValueError(f"model_id '{model_id}' is not registered in MODEL_MAPPINGS. ")
 
+        if not hasattr(model_args, "dtype"):
+            model_args.dtype = None
+
         # Initialize model with meta device for memory efficiency if specified
         if training_args.init_model_with_meta_device:
             with init_empty_weights():
