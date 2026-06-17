@@ -7,7 +7,7 @@ Generated: 2026-06-16 10:20:25
 - Model architecture, expert count, MoE routing, Whisper encoder, and manual EP8 expert slicing are unchanged.
 - Tuning surface: micro batch, gradient accumulation sync, attention backend, chunk loss, length bucketing, recompute, gradient clip, empty cache cadence, watchdog diagnostics.
 - Metrics are post-warmup only: skip first 10 steps; init, safe_open load, dataset build, and first compile are excluded.
-- The provided Zhihu URL was not directly readable in this environment, so the adopted items are standard MoE tuning practices that match the local code path: larger micro batch, grouped expert matmul, dispatch stability, reduced sync bubbles, and padding/bucket control.
+- The Zhihu URL was not directly readable initially; after the blog text was provided in the task thread, the adopted items were narrowed to the parts that match this training path: grouped expert matmul, token dispatch/combine overlap, reduced sync bubbles, and padding/bucket control.
 
 ## Current Implementation
 
@@ -40,9 +40,11 @@ Generated: 2026-06-16 10:20:25
 
 ## Best Available Recommendation
 
-No new complete mbs2 run is available yet. Best complete reference run remains `ep8_mbs1_ga4_rc_off_pad1536_nosync_rerun05`.
+Primary target is WPS, not strict HBM 55-60GB. The comparison baseline is the best EP8 LLM pack configuration from `pack_format_validation_report.md`: <https://github.com/Kimsale/qwen3.5_35B_mindspeed/blob/feat/llm-pad-to-pack-recompute/pack_format_validation_report.md>. The baseline is `pack rc_off, mbs=1`, stable 80 steps, last-40-step average `2111.4 WPS`, `~3.6s/iter`, `~40GB/card HBM`. The same report records `pack rc_on` at `1475.3 WPS` and `~33GB/card HBM`.
 
-## Phase Timing For Best Available
+No new complete mbs2 run is available yet. Among the complete non-pack reference runs listed above, `ep8_mbs1_ga4_rc_off_pad1280_current` is the best current-code WPS point at 1295.8 WPS, which is still -38.6% below the EP8 LLM pack baseline. The pack report also shows mbs=2 hangs during FSDP2 lazy initialization because variable packed sequence lengths are not rank-aligned. `ep8_mbs1_ga4_rc_off_pad1536_nosync_rerun05` is only a strict-HBM reference, not the main WPS baseline.
+
+## Phase Timing For Strict-HBM Reference
 
 Source: `ep8_mbs1_ga4_rc_off_pad1536_nosync_rerun05`
 

@@ -73,30 +73,31 @@ HBM 按 `npu-smi` 采集 MB 展示，括号内为 MB/1000 近似 GB。
 
 `*` 表示失败 run 中 warmup 后短窗口数据，只用于定位，不作为可上线配置。
 
-### 3.1 相比原始 Baseline 的提升
+### 3.1 与 EP8 LLM Pack 最优基线对比
 
-原始可跑 baseline 采用 EP=1/FSDP2，全分片，60 step 成功；主口径为 step10-60：step time 6.910s、input WPS 804.2、吞吐 4.631 samples/s、端到端 npu-smi AICORE 9.5%、HBM 32.5GB、power 158.3W。早期 EP=8 原始配置不是有效性能 baseline：它完成配置解析、EP mesh、数据/tokenizer、LoRA 注入和 DCP load，但在首个 `optimizer.step()` 初始化 Adam 状态时 OOM，无法报告 post-warmup WPS 或训练窗口 AICORE。
+当前主目标按 WPS 排序，不再把严格 HBM 55-60GB 作为主比较口径。对比基线改为 EP8 LLM 改为 pack 后的最优配置，数据来自 GitHub 报告 `pack_format_validation_report.md`：<https://github.com/Kimsale/qwen3.5_35B_mindspeed/blob/feat/llm-pad-to-pack-recompute/pack_format_validation_report.md>。该报告显示 `pack rc_off, mbs=1` 稳定完成 80 step，last 40 steps 平均 `2111.4 WPS`、约 `3.6s/iter`、约 `40GB/card HBM`。同报告中的 `pack rc_on` 为 `1475.3 WPS`、约 `33GB/card HBM`。
 
-按本报告的生产建议，最优稳定配置是 `ep8_mbs1_ga4_rc_off_pad1536_nosync`。它严格满足 HBM 55-60GB，相比原始 EP=1 baseline 的提升如下：
+在 manual EP8 非 pack 结果里，最高完成 run 是 `ep8_mbs1_ga4_rc_off_pad1024_pregather_nosync`，input WPS 1414.6；current-code 复跑最高 WPS 是 `pad1280_current`，input WPS 1295.8；严格 HBM 55-60GB 的 `pad1536_nosync_rerun05` 是 1132.5。它们都低于 pack rc_off 基线。
 
-| 指标 | 原始 EP=1 baseline | `pad1536_nosync` 最优稳定配置 | 变化 |
-|---|---:|---:|---:|
-| step time | 6.910s | 4.895s | 降低 29.2%，约 1.41x 加速 |
-| 吞吐 | 4.631 samples/s | 6.537 samples/s | +41.2% |
-| input WPS | 804.2 | 1132.5 | +40.8% |
-| AICORE mean | 9.5% | 23.43% | +13.93 pp |
-| HBM mean | 32.5GB | 56.4GB | +73.5%，达到 55-60GB 目标 |
-| Power mean | 158.3W | 164.5W | +3.9%，仍未达到 240W |
+| 指标 | EP8 LLM pack 最优基线 | `pad1024_pregather_nosync` | `pad1280_current` | `pad1536_nosync_rerun05` |
+|---|---:|---:|---:|---:|
+| input WPS | 2111.4 | 1414.6 | 1295.8 | 1132.5 |
+| step time | ~3.6s | 3.919s | 4.279s | 4.895s |
+| 相对 pack 基线 | 1.00x | 0.67x | 0.61x | 0.54x |
+| WPS 差距 | 0 | -33.0% | -38.6% | -46.4% |
+| 状态 | 最优基线 | 成功 80/80 | 成功 80/80 | 成功 80/80 |
+| HBM mean | ~40GB/card | 48.75GB | 51.93GB | 56.40GB |
+| 备注 | `ep8_pack_188.yaml`, last 40 steps | manual EP8 非 pack 历史最高 WPS | current-code 复跑最高 WPS | 仅作为严格 HBM 参考 |
 
-如果按 WPS 优先而不是严格 HBM 55-60GB，`pad1280_current` 是 current-code 复跑中最高推荐 WPS：step 4.279s、input WPS 1295.8、AICORE 23.58%、HBM 51.93GB、power 166.53W。相比原始 EP=1 baseline，step time 降低 38.1%，input WPS 提升 61.1%，但 HBM 不满足 55GB 下限。
+补充历史口径：原始可跑 EP=1/FSDP2 baseline 为 input WPS 804.2；manual EP8 已显著超过它。但新的主比较对象是 EP8 LLM pack 最优配置 2111.4，因此当前 manual EP8 非 pack 路径仍存在明显 WPS 差距。`pack rc_on` 可作为省显存备选：1475.3 WPS、约 33GB/card HBM，比 rc_off 少约 7GB/card，但 WPS 下降约 30%。
 
 最优配置解决的核心问题是：
 
 1. **把早期不可用的 EP8 路径变成稳定训练路径。**  
    原始 EP8 在首个 optimizer step OOM；manual EP8 的 safe_open 逐张量加载和 fused expert dim=0 切片避免一次性加载全量专家权重到单卡，使 EP8 能稳定完成 80/80 step。专家权重结构、专家数量、MoE 路由和 Whisper encoder 均未改变。
 
-2. **在吞吐提升的同时把 HBM 拉到目标区间。**  
-   `pad1024_pregather_nosync` 历史 WPS 最高，为 1414.6，但 HBM 只有 48.75GB；`pad1280_current` current-code WPS 最高，为 1295.8，但 HBM 只有 51.93GB；`pad1536_nosync` 将 HBM 提到 56.40GB，满足 55-60GB，同时保留 1132.5 WPS。
+2. **WPS 主目标下，pack 仍是更强基线。**
+   `pad1024_pregather_nosync` 历史 WPS 最高，为 1414.6；`pad1280_current` current-code WPS 最高，为 1295.8；`pad1536_nosync` 主要价值是把 HBM 提到 56.40GB，但 WPS 只有 1132.5。若目标是提高 WPS，应优先对齐或迁移 EP8 LLM pack 的有效 token 密度，而不是继续用 padding 追 HBM。
 
 3. **明确排除了几条无效优化路径。**  
    `mbs2/mbs4` 能提高短窗口 WPS 或峰值 AICORE，但会 OOM/挂起；FA2 对稳定 mbs1 无收益；rank64 非专家 LoRA 增加 backward/optimizer 时间，但没有提升平均 AICORE、功耗或 WPS；继续 padding 到 2048 会 HBM 越界并 OOM。
@@ -139,15 +140,15 @@ HBM 按 `npu-smi` 采集 MB 展示，括号内为 MB/1000 近似 GB。
 
 ## 6. 结论
 
-在“不改模型结构、LoRA-only、单机 8 卡 EP8、Qwen3.5-35B-A3B + Whisper-large-v3 audio”约束下，本轮没有找到同时满足 `AICORE 平均 40%+`、`HBM 55-60G`、`功耗平均 240W`、`高 WPS` 的稳定训练策略。
+在“不改模型结构、LoRA-only、单机 8 卡 EP8、Qwen3.5-35B-A3B + Whisper-large-v3 audio”约束下，本轮没有找到能超过 EP8 LLM pack 最优 WPS 基线 2111.4 的稳定训练策略。严格 HBM 55-60GB 不再作为主目标，只作为资源利用参考。
 
 原因来自实测而不是初始化噪声：
 
 1. **mbs2/mbs4 能提高短窗口 WPS 或峰值 AICORE，但不稳定。**  
    mbs2 rc_off 可短暂到 WPS 2718、AICORE peak 64%、power peak 243W，但 HBM 接近满卡并出现 OOM/挂起；mbs2+FA2 短窗口 WPS 提升到 3288、HBM 降到 53.6-55.9GB，但 step24 后仍挂起；mbs4 rc_on step1 后停在 0% AICORE。
 
-2. **稳定配置只能落在 mbs1/ga4，current-code 复跑最高稳定 AICORE 仍只有 23.58%。**  
-   复跑 `pad1248/1264/1280_current` 后，current-code 复跑组里最高 WPS 是 `pad1280_current`: WPS 1295.8、AICORE 23.58%、power 166.53W，但 HBM 只有 51.93GB。历史 `pad1024_pregather_nosync` WPS 更高，但 HBM 只有 48.75GB，不满足显存目标。继续用 padding 增 HBM 会增加 move/forward/clip 时间，`pad1536_nosync` 虽满足 HBM 55-60GB，但 WPS 降到 1132.5。FA2 对 mbs1 没有收益。
+2. **稳定配置只能落在 mbs1/ga4，但 WPS 离 pack 基线仍远。**
+   复跑 `pad1248/1264/1280_current` 后，current-code 复跑组里最高 WPS 是 `pad1280_current`: WPS 1295.8、AICORE 23.58%、power 166.53W。历史 `pad1024_pregather_nosync` WPS 更高，为 1414.6，但仍低于 pack rc_off 基线 2111.4。继续用 padding 增 HBM 会增加 move/forward/clip 时间，`pad1536_nosync` 虽满足 HBM 55-60GB，但 WPS 降到 1132.5。FA2 对 mbs1 没有收益。
 
 3. **扩大非专家 LoRA 训练负载不是有效解。**  
    rank16 attention-only 是 80 个 LoRA 张量、3.44M 可训练参数；rank64 非专家 LoRA 扩到 500 个 LoRA 张量、76.68M 可训练参数，并覆盖 full attention、linear attention、shared expert 的普通 Linear。该配置 HBM 达 57.52GB，但 AICORE 均值只有 21.92%、power 均值 159.94W、WPS 降到 1044.5。低秩小 GEMM 增多主要拉长 backward/optimizer，没有把 910B 平均功耗推到 240W。
@@ -162,23 +163,22 @@ HBM 按 `npu-smi` 采集 MB 展示，括号内为 MB/1000 近似 GB。
 
 ## 7. 推荐配置
 
-### 严格满足 HBM 55-60G
+### WPS 主目标推荐
 
-使用：
+若只看已完成稳定 run，manual EP8 非 pack 中 WPS 最高的是 `pad1024_pregather_nosync`，但它仍低于 EP8 LLM pack 最优基线 2111.4。严格 HBM 配置不再作为主推荐。
+
+历史最高完成 run：
 
 ```bash
 MASTER_PORT=6052 bash /data/sejin/baseline_26/scripts/run_audio_perf_experiment.sh \
-  ep8_mbs1_ga4_rc_off_pad1536_nosync \
-  /data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_mbs1_ga4_rc_off_pad1536_nosync.yaml \
+  ep8_mbs1_ga4_rc_off_pad1024_pregather_nosync \
+  /data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_mbs1_ga4_rc_off_pad1024_pregather_nosync.yaml \
   1500 10 1.0
 ```
 
-指标：step 4.929s，input WPS 1124.8，AICORE 23.40%，HBM 56.38GB，power 163.39W。
-复测 `rerun05` 指标：step 4.895s，input WPS 1132.5，AICORE 23.43%，HBM 56.40GB，power 164.54W。
+指标：step 3.919s，input WPS 1414.6，AICORE 18.47%，HBM 48.75GB，power 163.06W。
 
-### Current-Code 复跑最高推荐 WPS，不满足 HBM 目标
-
-使用：
+Current-code 复跑最高 WPS：
 
 ```bash
 MASTER_PORT=6063 bash /data/sejin/baseline_26/scripts/run_audio_perf_experiment.sh \
@@ -189,9 +189,18 @@ MASTER_PORT=6063 bash /data/sejin/baseline_26/scripts/run_audio_perf_experiment.
 
 指标：step 4.279s，input WPS 1295.8，AICORE 23.58%，HBM 51.93GB，power 166.53W。
 
-### HBM 接近 55G，WPS 高于 pad1536
+### 仅作 HBM 约束参考
 
-`pad1408_nosync`: step 4.786s，input WPS 1158.3，AICORE 22.48%，HBM 54.64GB，power 162.57W。
+若某个实验必须把 HBM 拉到 55-60GB，可保留 `pad1536_nosync` 作为参考，但它不是 WPS 主目标下的最佳配置。
+
+```bash
+MASTER_PORT=6052 bash /data/sejin/baseline_26/scripts/run_audio_perf_experiment.sh \
+  ep8_mbs1_ga4_rc_off_pad1536_nosync \
+  /data/sejin/third_party/mindspeed-mm-26.0.0/examples/qwen3_5_audio/perf_tuning/ep8_mbs1_ga4_rc_off_pad1536_nosync.yaml \
+  1500 10 1.0
+```
+
+复测 `rerun05` 指标：step 4.895s，input WPS 1132.5，AICORE 23.43%，HBM 56.40GB，power 164.54W。
 
 ---
 
@@ -205,4 +214,4 @@ MASTER_PORT=6063 bash /data/sejin/baseline_26/scripts/run_audio_perf_experiment.
 | 改训练范围，例如训练 audio_projector、Whisper LoRA 或专家/路由相关参数 | 增加反向计算和功耗 | 改变训练口径，且可能触及模型结构/数学口径。 |
 | mbs2 稳定化专项，包括 allocator、bucket、长样本裁剪、HCCL timeout/通信定位 | 可能提高 WPS | 当前多次复现 OOM/挂起，风险较高。 |
 
-本轮生产建议采用 `pad1536_nosync`；若更看重吞吐且接受 HBM 约 52GB，采用 `pad1280_current`；若希望 HBM 更接近 55GB 且接受较低 WPS，采用 `pad1408_nosync`。
+本轮 WPS 口径建议：主基线采用 EP8 LLM pack rc_off 最优 WPS 2111.4、约 40GB/card HBM；如果要省显存，pack rc_on 是 1475.3 WPS、约 33GB/card HBM。manual EP8 非 pack 路径里优先参考 `pad1024_pregather_nosync` 或 current-code `pad1280_current`，不要再把 `pad1536_nosync` 作为主推荐。`pad1536_nosync` 只用于需要 HBM 55-60GB 的资源占用对照。

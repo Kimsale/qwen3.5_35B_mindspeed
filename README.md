@@ -12,6 +12,20 @@
     </a>
 </p>
 
+# Qwen3.5-35B Audio Pipeline Experts Overlap 分支说明
+
+当前分支：`feat/qwen35-audio-pipeline-experts-overlap`。本分支基于稳定的 `feat/llm-pad-to-pack-recompute` 代码，给 Qwen3.5-35B-A3B + Whisper-large-v3 + LoRA 语音训练增加了手动 Pipeline Experts overlap 实验实现：MoE EP dispatch/combine 支持 chunk、多 stream 异步 AllToAll、专家计算流水化和 MoE phase timing。
+
+当前结论：Pipeline Experts overlap 已在 `172.29.226.188` 上完成 `80/80` step 稳定训练，但性能回退，不建议替换 WPS 最优基线。主对比基线是 EP8 LLM pack `rc_off, mbs=1`，last 40 steps `2111.4 WPS`、约 `3.6s/iter`、约 `40GB/card HBM`；本分支 Pipeline run 为 `645.5 WPS`、`8.589s/step`、`56.6GB/card HBM`。
+
+分支级总结和报告入口：
+
+- [Qwen3.5 35B LoRA MindSpeed-MM Notes](./QWEN35_35B_LORA_MINDSPEEDMM.md)
+- [Pipeline Experts 分支工作总结](./qwen35_audio_artifacts/reports/qwen35_audio_pipeline_branch_summary_20260617.md)
+- [Pipeline Experts 性能报告](./qwen35_audio_artifacts/reports/qwen35_audio_pipeline_experts_overlap_20260617.md)
+- [单次 Pipeline run 自动分析](./qwen35_audio_artifacts/reports/perf_runs/qwen35_audio_pipeline_mbs1_pad1536_ep8_8ada09f36_20260617_110652.md)
+- [EP8 LLM pack 最优基线报告副本](./qwen35_audio_artifacts/reports/pack_format_validation_report.md)
+
 # 简介
 
 ---
