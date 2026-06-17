@@ -222,6 +222,8 @@ class _AsyncA2AWork:
     def wait(self):
         if self.handle is not None:
             self.handle.wait()
+            # The shared comm stream may already contain later chunks.
+            return self.tensor
         if self.stream is not None and hasattr(torch, "npu") and torch.npu.is_available():
             torch.npu.current_stream().wait_stream(self.stream)
         return self.tensor
